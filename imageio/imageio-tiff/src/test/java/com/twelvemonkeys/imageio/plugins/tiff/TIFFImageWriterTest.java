@@ -1442,12 +1442,16 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
     }
 
     private byte[] writeSingle(final RenderedImage image, final ImageWriteParam param, final IIOMetadata streamMetadata) throws IOException {
+        return writeSingle(new IIOImage(image, null, null), param, streamMetadata);
+    }
+
+    private byte[] writeSingle(final IIOImage image, final ImageWriteParam param, final IIOMetadata streamMetadata) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
 
         try (ImageOutputStream output = ImageIO.createImageOutputStream(bytes)) {
             TIFFImageWriter writer = createWriter();
             writer.setOutput(output);
-            writer.write(streamMetadata, new IIOImage(image, null, null), param);
+            writer.write(streamMetadata, image, param);
             writer.dispose();
         }
 
@@ -1734,6 +1738,134 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
 
         BufferedImage read = readSingle(data);
         assertSamplesEquals("16 bit RGB little endian samples differ", image.getRaster(), read.getRaster());
+    }
+
+    // Planar configuration (PlanarConfiguration 2) support
+
+    /** Returns default image metadata for the given image, with PlanarConfiguration 2 (planar) requested. */
+    private IIOMetadata planarMetadata(final RenderedImage image, final ImageWriteParam param) throws IOException {
+        TIFFImageWriter writer = createWriter();
+
+        try {
+            IIOMetadata metadata = writer.getDefaultImageMetadata(ImageTypeSpecifier.createFromRenderedImage(image), param);
+
+            IIOMetadataNode customMeta = new IIOMetadataNode(SUN_NATIVE_IMAGE_METADATA_FORMAT_NAME);
+            IIOMetadataNode ifdNode = new IIOMetadataNode("TIFFIFD");
+            customMeta.appendChild(ifdNode);
+            createTIFFFieldNode(ifdNode, TIFF.TAG_PLANAR_CONFIGURATION, TIFF.TYPE_SHORT, TIFFExtension.PLANARCONFIG_PLANAR);
+            metadata.mergeTree(SUN_NATIVE_IMAGE_METADATA_FORMAT_NAME, customMeta);
+
+            return metadata;
+        }
+        finally {
+            writer.dispose();
+        }
+    }
+
+    @Test
+    public void testWritePlanar() throws IOException {
+        for (String compression : Arrays.asList("None", "LZW", "Deflate", "PackBits")) {
+            BufferedImage image = new BufferedImage(97, 43, BufferedImage.TYPE_3BYTE_BGR);
+            fillGradient(image);
+
+            TIFFImageWriter writer = createWriter();
+            ImageWriteParam param = writer.getDefaultWriteParam();
+            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            param.setCompressionType(compression);
+            writer.dispose();
+
+            byte[] data = writeSingle(new IIOImage(image, null, planarMetadata(image, param)), param, null);
+
+            Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+            assertEquals(TIFFExtension.PLANARCONFIG_PLANAR, (int) longs(ifd.getEntryById(TIFF.TAG_PLANAR_CONFIGURATION))[0]);
+
+            int rowsPerStrip = (int) longs(ifd.getEntryById(TIFF.TAG_ROWS_PER_STRIP))[0];
+            int stripsPerPlane = (43 + rowsPerStrip - 1) / rowsPerStrip;
+            assertEquals(3 * stripsPerPlane, longs(ifd.getEntryById(TIFF.TAG_STRIP_OFFSETS)).length,
+                         "Planar files should have SamplesPerPixel * StripsPerImage strips");
+            assertEquals(3 * stripsPerPlane, longs(ifd.getEntryById(TIFF.TAG_STRIP_BYTE_COUNTS)).length);
+
+            assertImageEquals("Planar " + compression + " image differs", image, readSingle(data), 0);
+        }
+    }
+
+    @Test
+    public void testWritePlanarTiled() throws IOException {
+        BufferedImage image = new BufferedImage(100, 60, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(image);
+
+        TIFFImageWriter writer = createWriter();
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setTilingMode(ImageWriteParam.MODE_EXPLICIT);
+        param.setTiling(32, 16, 0, 0);
+        writer.dispose();
+
+        byte[] data = writeSingle(new IIOImage(image, null, planarMetadata(image, param)), param, null);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertEquals(TIFFExtension.PLANARCONFIG_PLANAR, (int) longs(ifd.getEntryById(TIFF.TAG_PLANAR_CONFIGURATION))[0]);
+
+        int tilesPerPlane = ((100 + 31) / 32) * ((60 + 15) / 16);
+        assertEquals(3 * tilesPerPlane, longs(ifd.getEntryById(TIFF.TAG_TILE_OFFSETS)).length,
+                     "Planar files should have SamplesPerPixel * TilesPerImage tiles");
+
+        assertImageEquals("Planar tiled image differs", image, readSingle(data), 0);
+    }
+
+    @Test
+    public void testWritePlanar16Bit() throws IOException {
+        BufferedImage image = create16BitRGB(53, 31, false);
+
+        byte[] data = writeSingle(new IIOImage(image, null, planarMetadata(image, null)), null, null);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertEquals(TIFFExtension.PLANARCONFIG_PLANAR, (int) longs(ifd.getEntryById(TIFF.TAG_PLANAR_CONFIGURATION))[0]);
+        assertArrayEquals(new long[] {16, 16, 16}, longs(ifd.getEntryById(TIFF.TAG_BITS_PER_SAMPLE)));
+
+        BufferedImage read = readSingle(data);
+        assertSamplesEquals("Planar 16 bit RGB samples differ", image.getRaster(), read.getRaster());
+    }
+
+    @Test
+    public void testWritePlanarIgnoredForSingleBand() throws IOException {
+        // PlanarConfiguration is meaningless for single band data, and should be left out (chunky is the default)
+        BufferedImage image = new BufferedImage(64, 40, BufferedImage.TYPE_BYTE_GRAY);
+        fillGradient(image);
+
+        byte[] data = writeSingle(new IIOImage(image, null, planarMetadata(image, null)), null, null);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertNull(ifd.getEntryById(TIFF.TAG_PLANAR_CONFIGURATION), "PlanarConfiguration should not be written for single band data");
+
+        assertImageEquals("Gray image differs", image, readSingle(data), 0);
+    }
+
+    @Test
+    public void testWritePlanarIgnoredForJPEG() throws IOException {
+        // JPEG compressed data is always written chunky
+        // NOTE: Smooth gradient, as the sawtooth of fillGradient does not survive lossy JPEG compression
+        BufferedImage image = new BufferedImage(64, 40, BufferedImage.TYPE_3BYTE_BGR);
+        Graphics2D g2d = image.createGraphics();
+        try {
+            g2d.setPaint(new GradientPaint(0, 0, Color.RED, image.getWidth(), image.getHeight(), Color.BLUE));
+            g2d.fillRect(0, 0, image.getWidth(), image.getHeight());
+        }
+        finally {
+            g2d.dispose();
+        }
+
+        TIFFImageWriter writer = createWriter();
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+        param.setCompressionType("JPEG");
+        writer.dispose();
+
+        byte[] data = writeSingle(new IIOImage(image, null, planarMetadata(image, param)), param, null);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertNull(ifd.getEntryById(TIFF.TAG_PLANAR_CONFIGURATION), "PlanarConfiguration should not be written for JPEG compressed data");
+
+        assertImageEquals("JPEG image differs", image, readSingle(data), 5); // Allow room for JPEG compression
     }
 
     private static class ImageInfo {

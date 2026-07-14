@@ -112,6 +112,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
     // Support more of the ImageIO metadata (ie. compression from metadata, etc)
     // Support multiple strips (about 8K per strip, as recommended by the TIFF 6.0 spec) and tiled writing
     // Support 16 bit multi-channel (ie. RGB/RGBA) sample writing
+    // Support planar (PlanarConfiguration 2) writing, controlled by the image metadata
 
     /** The TIFF 6.0 spec recommends writing strips of about 8K bytes (before compression). */
     private static final long DEFAULT_STRIP_SIZE = 8L * 1024;
@@ -183,11 +184,17 @@ public final class TIFFImageWriter extends ImageWriterBase {
 
         int compression = ((Number) entries.get(TIFF.TAG_COMPRESSION).getValue()).intValue();
 
+        // PlanarConfiguration 2 (planar) is written if requested by the metadata, and the sample
+        // layout allows it (validated in initMeta). Each plane holds the samples of a single band
+        boolean planar = isPlanar(entries);
+        int planes = planar ? sampleModel.getNumBands() : 1;
+
         // Tiled or striped layout, depending on the tiling settings of the param.
         // NOTE: Updates the entries with TileWidth/TileLength or RowsPerStrip
-        SegmentLayout layout = computeSegmentLayout(imageIndex, param, entries, sampleModel, width, height);
+        SegmentLayout layout = computeSegmentLayout(imageIndex, param, entries, sampleModel, width, height, planar);
 
-        long[] segmentOffsets = new long[layout.segsAcross * layout.segsDown];
+        // For planar data, the segments of each plane follow those of the preceding plane
+        long[] segmentOffsets = new long[planes * layout.segsAcross * layout.segsDown];
         long[] segmentByteCounts = new long[segmentOffsets.length];
 
         long nextIFDPointerOffset;
@@ -197,16 +204,21 @@ public final class TIFFImageWriter extends ImageWriterBase {
             // This implementation allows semi-streaming-compatible uncompressed TIFFs
             padToWordBoundary();
 
-            long rowSize = ((long) layout.segmentWidth * computePixelSize(sampleModel) + 7L) / 8L;
+            // Planar segments hold a single band per pixel, chunky segments hold all bands
+            int bitsPerPixel = planar ? sampleModel.getSampleSize(0) : computePixelSize(sampleModel);
+            long rowSize = ((long) layout.segmentWidth * bitsPerPixel + 7L) / 8L;
+            int segsPerPlane = layout.segsAcross * layout.segsDown;
 
-            for (int segY = 0; segY < layout.segsDown; segY++) {
-                // Strips are clipped to the image height, tiles are padded to the full tile height
-                long rows = layout.tiled
-                            ? layout.segmentHeight
-                            : Math.min(layout.segmentHeight, height - (long) segY * layout.segmentHeight);
+            for (int plane = 0; plane < planes; plane++) {
+                for (int segY = 0; segY < layout.segsDown; segY++) {
+                    // Strips are clipped to the image height, tiles are padded to the full tile height
+                    long rows = layout.tiled
+                                ? layout.segmentHeight
+                                : Math.min(layout.segmentHeight, height - (long) segY * layout.segmentHeight);
 
-                for (int segX = 0; segX < layout.segsAcross; segX++) {
-                    segmentByteCounts[segY * layout.segsAcross + segX] = rows * rowSize;
+                    for (int segX = 0; segX < layout.segsAcross; segX++) {
+                        segmentByteCounts[plane * segsPerPlane + segY * layout.segsAcross + segX] = rows * rowSize;
+                    }
                 }
             }
 
@@ -229,7 +241,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
             tiffWriter.writeOffset(imageOutput, 0); // Update next IFD pointer later
 
             // The image data follows the IFD directly
-            writeSegments(imageIndex, renderedImage, param, entries, layout, segmentOffsets, segmentByteCounts);
+            writeSegments(imageIndex, renderedImage, param, entries, layout, planar, segmentOffsets, segmentByteCounts);
 
             // Link the previous IFD pointer (or the stream header) to the IFD just written.
             // NOTE: When at the start of the chain, writeIFD has already written the pointer, rewriting it is harmless
@@ -246,10 +258,11 @@ public final class TIFFImageWriter extends ImageWriterBase {
 
             // Write the image data, one segment (strip or tile) at a time, collecting offsets and byte counts
             if (compression == TIFFExtension.COMPRESSION_JPEG) {
+                // NOTE: JPEG compressed data is always written chunky (guarded by canWritePlanar)
                 writeJPEGSegments(imageIndex, image, renderedImage, param, layout, segmentOffsets, segmentByteCounts);
             }
             else {
-                writeSegments(imageIndex, renderedImage, param, entries, layout, segmentOffsets, segmentByteCounts);
+                writeSegments(imageIndex, renderedImage, param, entries, layout, planar, segmentOffsets, segmentByteCounts);
             }
 
             putSegmentEntries(entries, layout.tiled, offsetType, segmentOffsets, segmentByteCounts);
@@ -291,7 +304,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
      * entries (TileWidth/TileLength or RowsPerStrip).
      */
     private SegmentLayout computeSegmentLayout(final int imageIndex, final ImageWriteParam param, final Map<Integer, Entry> entries,
-                                               final SampleModel sampleModel, final int width, final int height) {
+                                               final SampleModel sampleModel, final int width, final int height, final boolean planar) {
         int compression = ((Number) entries.get(TIFF.TAG_COMPRESSION).getValue()).intValue();
         boolean jpeg = compression == TIFFExtension.COMPRESSION_JPEG;
 
@@ -324,8 +337,11 @@ public final class TIFFImageWriter extends ImageWriterBase {
             segmentWidth = width;
 
             // JPEG data is written as a single strip, to avoid repeating the tables for each strip.
-            // Otherwise, write strips of about 8K bytes (before compression), as recommended by the spec
-            segmentHeight = jpeg ? height : computeRowsPerStrip(width, computePixelSize(sampleModel), height);
+            // Otherwise, write strips of about 8K bytes (before compression), as recommended by the spec.
+            // NOTE: For planar data, a strip holds the samples of a single band only
+            segmentHeight = jpeg
+                            ? height
+                            : computeRowsPerStrip(width, planar ? sampleModel.getSampleSize(0) : computePixelSize(sampleModel), height);
 
             segsAcross = 1;
             segsDown = (height + segmentHeight - 1) / segmentHeight;
@@ -552,6 +568,35 @@ public final class TIFFImageWriter extends ImageWriterBase {
         return predictorEntry != null && predictorEntry.getValue().equals(TIFFExtension.PREDICTOR_HORIZONTAL_DIFFERENCING);
     }
 
+    private static boolean isPlanar(final Map<Integer, Entry> entries) {
+        Entry planarEntry = entries.get(TIFF.TAG_PLANAR_CONFIGURATION);
+
+        return planarEntry != null && ((Number) planarEntry.getValue()).intValue() == TIFFExtension.PLANARCONFIG_PLANAR;
+    }
+
+    /**
+     * Returns whether the given sample layout can be written as separate planes
+     * (PlanarConfiguration 2), one band per plane.
+     */
+    private static boolean canWritePlanar(final SampleModel sampleModel, final int compression) {
+        // Planar configuration only makes sense for multi-band data,
+        // and JPEG compressed data is always written chunky
+        if (sampleModel.getNumBands() < 2 || compression == TIFFExtension.COMPRESSION_JPEG) {
+            return false;
+        }
+
+        // Uniform sample sizes of at least 8 bits ensures a predictable per-plane layout
+        int[] sampleSize = sampleModel.getSampleSize();
+
+        for (int size : sampleSize) {
+            if (size < 8 || size != sampleSize[0]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private int getPhotometricInterpretation(final ColorModel colorModel, int compression) {
         if (colorModel.getPixelSize() == 1) {
             if (colorModel instanceof IndexColorModel) {
@@ -618,7 +663,8 @@ public final class TIFFImageWriter extends ImageWriterBase {
      * and stores the offsets and byte counts of the segments written.
      */
     private void writeSegments(final int imageIndex, final RenderedImage image, final ImageWriteParam param, final Map<Integer, Entry> entries,
-                               final SegmentLayout layout, final long[] segmentOffsets, final long[] segmentByteCounts) throws IOException {
+                               final SegmentLayout layout, final boolean planar,
+                               final long[] segmentOffsets, final long[] segmentByteCounts) throws IOException {
         processImageStarted(imageIndex);
 
         int width = image.getWidth();
@@ -627,9 +673,13 @@ public final class TIFFImageWriter extends ImageWriterBase {
         int minY = image.getMinY();
 
         SampleModel sampleModel = image.getSampleModel();
-        int samplesPerPixel = sampleModel.getNumBands();
+        int numBands = sampleModel.getNumBands();
         int bitsPerSample = validateBitsPerSample(sampleModel);
         ByteOrder byteOrder = imageOutput.getByteOrder();
+
+        // For planar data, each plane holds a single band, and the planes are written one after the other
+        int planes = planar ? numBands : 1;
+        int samplesPerPixel = planar ? 1 : numBands;
 
         // Strips span the full image width, tiles (including partial edge tiles) are padded to the
         // full tile width, so the number of columns per segment is the same for every segment
@@ -641,35 +691,40 @@ public final class TIFFImageWriter extends ImageWriterBase {
 
         int segment = 0;
 
-        for (int segY = 0; segY < layout.segsDown; segY++) {
-            for (int segX = 0; segX < layout.segsAcross; segX++) {
-                int x = segX * layout.segmentWidth;
-                int y = segY * layout.segmentHeight;
+        for (int plane = 0; plane < planes; plane++) {
+            // The band to write for this plane, or -1 for all bands (chunky)
+            int band = planar ? plane : -1;
 
-                Rectangle region = new Rectangle(minX + x, minY + y,
-                                                 Math.min(layout.segmentWidth, width - x), Math.min(layout.segmentHeight, height - y));
-                Raster data = getRegion(image, region);
+            for (int segY = 0; segY < layout.segsDown; segY++) {
+                for (int segX = 0; segX < layout.segsAcross; segX++) {
+                    int x = segX * layout.segmentWidth;
+                    int y = segY * layout.segmentHeight;
 
-                // Strips are clipped to the image height, tiles are padded to the full tile height
-                int rows = layout.tiled ? layout.segmentHeight : region.height;
+                    Rectangle region = new Rectangle(minX + x, minY + y,
+                                                     Math.min(layout.segmentWidth, width - x), Math.min(layout.segmentHeight, height - y));
+                    Raster data = getRegion(image, region);
 
-                segmentOffsets[segment] = imageOutput.getStreamPosition();
+                    // Strips are clipped to the image height, tiles are padded to the full tile height
+                    int rows = layout.tiled ? layout.segmentHeight : region.height;
 
-                DataOutput stream = createCompressorStream(columns, rows, samplesPerPixel, bitsPerSample, param, entries);
-                try {
-                    writeSegmentRows(stream, data, region, rows, samplesPerPixel, bitsPerSample, byteOrder, rowBuffer, samples);
-                }
-                finally {
-                    if (stream instanceof DataOutputStream) {
-                        // Each segment is an independent stream of compressed data
-                        ((DataOutputStream) stream).close();
+                    segmentOffsets[segment] = imageOutput.getStreamPosition();
+
+                    DataOutput stream = createCompressorStream(columns, rows, samplesPerPixel, bitsPerSample, param, entries);
+                    try {
+                        writeSegmentRows(stream, data, region, rows, band, samplesPerPixel, bitsPerSample, byteOrder, rowBuffer, samples);
                     }
+                    finally {
+                        if (stream instanceof DataOutputStream) {
+                            // Each segment is an independent stream of compressed data
+                            ((DataOutputStream) stream).close();
+                        }
+                    }
+
+                    segmentByteCounts[segment] = imageOutput.getStreamPosition() - segmentOffsets[segment];
+                    segment++;
+
+                    processImageProgress(segment * 100f / segmentOffsets.length);
                 }
-
-                segmentByteCounts[segment] = imageOutput.getStreamPosition() - segmentOffsets[segment];
-                segment++;
-
-                processImageProgress(segment * 100f / segmentOffsets.length);
             }
         }
 
@@ -690,8 +745,13 @@ public final class TIFFImageWriter extends ImageWriterBase {
         return image.getData(region);
     }
 
+    /**
+     * Writes the rows of a single segment (strip or tile).
+     *
+     * @param band the band to write, for planar data, or {@code -1} to write all bands (chunky).
+     */
     private void writeSegmentRows(final DataOutput stream, final Raster data, final Rectangle region,
-                                  final int rows, final int numBands, final int bitsPerSample, final ByteOrder byteOrder,
+                                  final int rows, final int band, final int numBands, final int bitsPerSample, final ByteOrder byteOrder,
                                   final byte[] rowBuffer, final int[] samples) throws IOException {
         // Zeroed once per segment: packRow rewrites the sample bytes for every row, so only the padding
         // bytes of a partial (right edge) tile need to be zeroed, and they are never written to
@@ -700,7 +760,13 @@ public final class TIFFImageWriter extends ImageWriterBase {
         for (int row = 0; row < rows; row++) {
             if (row < region.height) {
                 // NOTE: Samples are fetched one full row at a time, as the per-sample accessors are much slower
-                data.getPixels(region.x, region.y + row, region.width, 1, samples);
+                if (band < 0) {
+                    data.getPixels(region.x, region.y + row, region.width, 1, samples);
+                }
+                else {
+                    data.getSamples(region.x, region.y + row, region.width, 1, band, samples);
+                }
+
                 packRow(rowBuffer, samples, region.width, numBands, bitsPerSample, byteOrder);
             }
             else if (row == region.height) {
@@ -1020,6 +1086,16 @@ public final class TIFFImageWriter extends ImageWriterBase {
         // TODO: Allow metadata to take precedence?
         int photometricInterpretation = getPhotometricInterpretation(colorModel, compression);
         entries.put(TIFF.TAG_PHOTOMETRIC_INTERPRETATION, new TIFFEntry(TIFF.TAG_PHOTOMETRIC_INTERPRETATION, TIFF.TYPE_SHORT, photometricInterpretation));
+
+        // Honor PlanarConfiguration 2 (planar) from the metadata, for sample layouts that support it.
+        // NOTE: Chunky (1) is the default and need not be written
+        if (ifd != null && canWritePlanar(sampleModel, compression)) {
+            Entry planarEntry = ifd.getEntryById(TIFF.TAG_PLANAR_CONFIGURATION);
+
+            if (planarEntry != null && ((Number) planarEntry.getValue()).intValue() == TIFFExtension.PLANARCONFIG_PLANAR) {
+                entries.put(TIFF.TAG_PLANAR_CONFIGURATION, new TIFFEntry(TIFF.TAG_PLANAR_CONFIGURATION, TIFF.TYPE_SHORT, TIFFExtension.PLANARCONFIG_PLANAR));
+            }
+        }
 
         // If numComponents > numColorComponents, write ExtraSamples
         if (numBands > colorModel.getNumColorComponents()) {
