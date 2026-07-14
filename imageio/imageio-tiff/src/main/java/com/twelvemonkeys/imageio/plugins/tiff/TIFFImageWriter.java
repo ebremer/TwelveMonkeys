@@ -84,7 +84,6 @@ import static com.twelvemonkeys.imageio.plugins.tiff.TIFFStreamMetadata.configur
  */
 public final class TIFFImageWriter extends ImageWriterBase {
     // Long term
-    // TODO: Support thumbnails
     // TODO: Support JPEG compression of CMYK data (pending JPEGImageWriter CMYK write support)
     // ----
     // TODO: Support use-case: Transcode multi-layer PSD to multi-page TIFF with metadata (hard, as Photoshop don't store layers as multi-page TIFF...)
@@ -113,6 +112,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
     // Support multiple strips (about 8K per strip, as recommended by the TIFF 6.0 spec) and tiled writing
     // Support 16 bit multi-channel (ie. RGB/RGBA) sample writing
     // Support planar (PlanarConfiguration 2) writing, controlled by the image metadata
+    // Support thumbnails, written as reduced-resolution images in SubIFDs (tag 330)
 
     /** The TIFF 6.0 spec recommends writing strips of about 8K bytes (before compression). */
     private static final long DEFAULT_STRIP_SIZE = 8L * 1024;
@@ -197,9 +197,13 @@ public final class TIFFImageWriter extends ImageWriterBase {
         long[] segmentOffsets = new long[planes * layout.segsAcross * layout.segsDown];
         long[] segmentByteCounts = new long[segmentOffsets.length];
 
+        // Thumbnails are written as reduced-resolution images in SubIFDs (tag 330), after the image data.
+        // As their offsets are unknown until they are written, the IFD can't be written up front
+        boolean hasThumbnails = image.getNumThumbnails() > 0;
+
         long nextIFDPointerOffset;
 
-        if (compression == TIFFBaseline.COMPRESSION_NONE) {
+        if (compression == TIFFBaseline.COMPRESSION_NONE && !hasThumbnails) {
             // Uncompressed data has predictable size, so we write the IFD before the image data.
             // This implementation allows semi-streaming-compatible uncompressed TIFFs
             padToWordBoundary();
@@ -266,6 +270,14 @@ public final class TIFFImageWriter extends ImageWriterBase {
             }
 
             putSegmentEntries(entries, layout.tiled, offsetType, segmentOffsets, segmentByteCounts);
+
+            // Write the thumbnails as reduced-resolution images in SubIFDs (tag 330, as in TIFF/EP and DNG)
+            if (hasThumbnails) {
+                long[] subIFDOffsets = writeThumbnails(imageIndex, image, tiffWriter, offsetType);
+
+                entries.put(TIFF.TAG_SUB_IFD, new TIFFEntry(TIFF.TAG_SUB_IFD, offsetType,
+                                                            subIFDOffsets.length == 1 ? subIFDOffsets[0] : subIFDOffsets));
+            }
 
             padToWordBoundary();
 
@@ -1001,6 +1013,68 @@ public final class TIFFImageWriter extends ImageWriterBase {
         return tileRaster;
     }
 
+    /**
+     * Writes the thumbnails of the given image as reduced-resolution images in SubIFDs (tag 330),
+     * as in TIFF/EP and DNG. The thumbnails are not part of the main IFD chain, and thus do not
+     * appear as pages to page-oriented readers.
+     * <p>
+     * The thumbnail data is always written uncompressed, chunky, as a single strip.
+     * </p>
+     *
+     * @return the IFD offsets of the thumbnails written, in order.
+     */
+    private long[] writeThumbnails(final int imageIndex, final IIOImage image, final TIFFWriter tiffWriter, final short offsetType) throws IOException {
+        long[] subIFDOffsets = new long[image.getNumThumbnails()];
+        ByteOrder byteOrder = imageOutput.getByteOrder();
+
+        for (int i = 0; i < subIFDOffsets.length; i++) {
+            processThumbnailStarted(imageIndex, i);
+
+            BufferedImage thumbnail = image.getThumbnail(i);
+
+            int width = thumbnail.getWidth();
+            int height = thumbnail.getHeight();
+
+            // The default metadata (compression None) holds PhotometricInterpretation, BitsPerSample,
+            // SamplesPerPixel, ColorMap etc. for the thumbnail's own image type
+            TIFFImageMetadata thumbnailMetadata = getDefaultImageMetadata(ImageTypeSpecifiers.createFromRenderedImage(thumbnail), null);
+
+            Map<Integer, Entry> entries = new LinkedHashMap<>();
+            for (Entry entry : thumbnailMetadata.getIFD()) {
+                entries.put((Integer) entry.getIdentifier(), entry);
+            }
+
+            entries.put(TIFF.TAG_SUBFILE_TYPE, new TIFFEntry(TIFF.TAG_SUBFILE_TYPE, TIFF.TYPE_LONG, TIFFBaseline.FILETYPE_REDUCEDIMAGE));
+            entries.put(TIFF.TAG_IMAGE_WIDTH, new TIFFEntry(TIFF.TAG_IMAGE_WIDTH, width));
+            entries.put(TIFF.TAG_IMAGE_HEIGHT, new TIFFEntry(TIFF.TAG_IMAGE_HEIGHT, height));
+            entries.put(TIFF.TAG_ROWS_PER_STRIP, new TIFFEntry(TIFF.TAG_ROWS_PER_STRIP, height));
+
+            Raster data = thumbnail.getRaster();
+            int numBands = data.getNumBands();
+            int bitsPerSample = validateBitsPerSample(data.getSampleModel());
+
+            byte[] rowBuffer = new byte[(int) (((long) width * numBands * bitsPerSample + 7) / 8)];
+            int[] samples = new int[width * numBands];
+
+            long dataOffset = imageOutput.getStreamPosition();
+            writeSegmentRows(imageOutput, data, new Rectangle(0, 0, width, height), height, -1, numBands, bitsPerSample, byteOrder, rowBuffer, samples);
+            long byteCount = imageOutput.getStreamPosition() - dataOffset;
+
+            entries.put(TIFF.TAG_STRIP_OFFSETS, new TIFFEntry(TIFF.TAG_STRIP_OFFSETS, offsetType, dataOffset));
+            entries.put(TIFF.TAG_STRIP_BYTE_COUNTS, new TIFFEntry(TIFF.TAG_STRIP_BYTE_COUNTS, offsetType, byteCount));
+
+            padToWordBoundary();
+
+            subIFDOffsets[i] = tiffWriter.writeIFD(entries.values(), imageOutput); // NOTE: Writer takes care of ordering tags
+            tiffWriter.writeOffset(imageOutput, 0); // SubIFDs are not chained
+
+            processThumbnailProgress(100f);
+            processThumbnailComplete();
+        }
+
+        return subIFDOffsets;
+    }
+
     private static void flushStream(DataOutput stream) throws IOException {
         // Need to flush/start new compression for each row, for proper LZW/PackBits/Deflate/ZLib
         if (stream instanceof DataOutputStream) {
@@ -1287,6 +1361,15 @@ public final class TIFFImageWriter extends ImageWriterBase {
         sequenceTIFFWriter = null;
         sequenceLastIFDPos = -1;
         imageOutput.flush();
+    }
+
+    // Thumbnails
+
+    @Override
+    public int getNumThumbnailsSupported(final ImageTypeSpecifier imageType, final ImageWriteParam param,
+                                         final IIOMetadata streamMetadata, final IIOMetadata imageMetadata) {
+        // Thumbnails are written as reduced-resolution images in SubIFDs (tag 330), there is no fixed limit
+        return Integer.MAX_VALUE;
     }
 
     @Override

@@ -1868,6 +1868,193 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
         assertImageEquals("JPEG image differs", image, readSingle(data), 5); // Allow room for JPEG compression
     }
 
+    // Thumbnail support
+
+    /**
+     * Asserts that the (uncompressed, chunky, single strip) thumbnail data referenced by the given
+     * sub-IFD matches the expected image, by reading the strip data straight out of the TIFF stream.
+     */
+    private static void assertThumbnailData(final byte[] data, final Directory thumbnailIFD, final BufferedImage expected) {
+        assertEquals(TIFFBaseline.FILETYPE_REDUCEDIMAGE, (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_SUBFILE_TYPE))[0],
+                     "Thumbnail should be marked as a reduced-resolution image (NewSubfileType 1)");
+        assertEquals(TIFFBaseline.COMPRESSION_NONE, (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_COMPRESSION))[0],
+                     "Thumbnail data should be uncompressed");
+
+        int width = (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_IMAGE_WIDTH))[0];
+        int height = (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_IMAGE_HEIGHT))[0];
+        int numBands = (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_SAMPLES_PER_PIXEL))[0];
+
+        assertEquals(expected.getWidth(), width, "Thumbnail width differs");
+        assertEquals(expected.getHeight(), height, "Thumbnail height differs");
+        assertEquals(expected.getRaster().getNumBands(), numBands, "Thumbnail SamplesPerPixel differs");
+        assertEquals(8, (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_BITS_PER_SAMPLE))[0], "Expected 8 bit thumbnail samples");
+        assertEquals(height, (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_ROWS_PER_STRIP))[0], "Thumbnail should be a single strip");
+
+        long byteCount = longs(thumbnailIFD.getEntryById(TIFF.TAG_STRIP_BYTE_COUNTS))[0];
+        assertEquals((long) width * height * numBands, byteCount, "Unexpected thumbnail StripByteCounts");
+
+        int offset = (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_STRIP_OFFSETS))[0];
+        assertTrue(offset + byteCount <= data.length, "Thumbnail strip outside of stream");
+
+        Raster raster = expected.getRaster();
+
+        for (int y = 0, i = offset; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                for (int b = 0; b < numBands; b++, i++) {
+                    assertEquals(raster.getSample(x, y, b), data[i] & 0xff,
+                                 String.format("Thumbnail sample at (%d,%d) band %d differs", x, y, b));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testWriterSupportsThumbnails() throws IOException {
+        TIFFImageWriter writer = createWriter();
+
+        try {
+            assertTrue(writer.getNumThumbnailsSupported(null, null, null, null) > 0, "Writer should support thumbnails");
+        }
+        finally {
+            writer.dispose();
+        }
+    }
+
+    @Test
+    public void testWriteThumbnail() throws IOException {
+        BufferedImage image = new BufferedImage(90, 60, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(image);
+        BufferedImage thumbnail = new BufferedImage(9, 6, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(thumbnail);
+
+        byte[] data = writeSingle(new IIOImage(image, Arrays.asList(thumbnail), null), null, null);
+
+        // The main image is unaffected, and the thumbnail must not appear as a page
+        try (ImageInputStream input = new ByteArrayImageInputStream(data)) {
+            ImageReader reader = ImageIO.getImageReaders(input).next();
+
+            try {
+                reader.setInput(input);
+
+                assertEquals(1, reader.getNumImages(true), "Thumbnail should not be part of the main IFD chain");
+                assertImageEquals("Main image differs", image, reader.read(0), 0);
+            }
+            finally {
+                reader.dispose();
+            }
+        }
+
+        // The thumbnail is stored as a reduced-resolution image in a SubIFD (tag 330)
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        Entry subIFDEntry = ifd.getEntryById(TIFF.TAG_SUB_IFD);
+        assertNotNull(subIFDEntry, "Missing SubIFDs (330) entry");
+
+        Object subIFDValue = subIFDEntry.getValue();
+        assertTrue(subIFDValue instanceof Directory, "SubIFDs entry should hold a parsed sub-IFD, was: " + subIFDValue.getClass());
+
+        assertThumbnailData(data, (Directory) subIFDValue, thumbnail);
+    }
+
+    @Test
+    public void testWriteMultipleThumbnails() throws IOException {
+        BufferedImage image = new BufferedImage(90, 60, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(image);
+        BufferedImage large = new BufferedImage(23, 15, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(large);
+        BufferedImage small = new BufferedImage(9, 6, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(small);
+
+        byte[] data = writeSingle(new IIOImage(image, Arrays.asList(large, small), null), null, null);
+
+        try (ImageInputStream input = new ByteArrayImageInputStream(data)) {
+            ImageReader reader = ImageIO.getImageReaders(input).next();
+
+            try {
+                reader.setInput(input);
+                assertEquals(1, reader.getNumImages(true), "Thumbnails should not be part of the main IFD chain");
+            }
+            finally {
+                reader.dispose();
+            }
+        }
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        Object subIFDValue = ifd.getEntryById(TIFF.TAG_SUB_IFD).getValue();
+        assertTrue(subIFDValue instanceof Directory[], "SubIFDs entry should hold parsed sub-IFDs, was: " + subIFDValue.getClass());
+
+        Directory[] thumbnailIFDs = (Directory[]) subIFDValue;
+        assertEquals(2, thumbnailIFDs.length, "Expected one SubIFD per thumbnail");
+
+        // The thumbnails are written in order
+        assertThumbnailData(data, thumbnailIFDs[0], large);
+        assertThumbnailData(data, thumbnailIFDs[1], small);
+    }
+
+    @Test
+    public void testWriteThumbnailCompressedMainImage() throws IOException {
+        // The main image compression does not affect the thumbnails, which are always written uncompressed
+        for (String compression : Arrays.asList("LZW", "Deflate", "JPEG")) {
+            BufferedImage image = new BufferedImage(90, 60, BufferedImage.TYPE_3BYTE_BGR);
+            fillGradient(image);
+            BufferedImage thumbnail = new BufferedImage(9, 6, BufferedImage.TYPE_3BYTE_BGR);
+            fillGradient(thumbnail);
+
+            TIFFImageWriter writer = createWriter();
+            ImageWriteParam param = writer.getDefaultWriteParam();
+            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            param.setCompressionType(compression);
+            writer.dispose();
+
+            byte[] data = writeSingle(new IIOImage(image, Arrays.asList(thumbnail), null), param, null);
+
+            Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+            Entry subIFDEntry = ifd.getEntryById(TIFF.TAG_SUB_IFD);
+            assertNotNull(subIFDEntry, "Missing SubIFDs (330) entry for " + compression);
+
+            assertThumbnailData(data, (Directory) subIFDEntry.getValue(), thumbnail);
+        }
+    }
+
+    @Test
+    public void testWriteThumbnailTiledMainImage() throws IOException {
+        BufferedImage image = new BufferedImage(100, 60, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(image);
+        BufferedImage thumbnail = new BufferedImage(9, 6, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(thumbnail);
+
+        TIFFImageWriter writer = createWriter();
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setTilingMode(ImageWriteParam.MODE_EXPLICIT);
+        param.setTiling(32, 16, 0, 0);
+        writer.dispose();
+
+        byte[] data = writeSingle(new IIOImage(image, Arrays.asList(thumbnail), null), param, null);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertNotNull(ifd.getEntryById(TIFF.TAG_TILE_OFFSETS), "Main image should still be tiled");
+
+        assertThumbnailData(data, (Directory) ifd.getEntryById(TIFF.TAG_SUB_IFD).getValue(), thumbnail);
+        assertImageEquals("Main image differs", image, readSingle(data), 0);
+    }
+
+    @Test
+    public void testWriteThumbnailGrayscale() throws IOException {
+        // The thumbnail may have a different image type than the main image
+        BufferedImage image = new BufferedImage(90, 60, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(image);
+        BufferedImage thumbnail = new BufferedImage(9, 6, BufferedImage.TYPE_BYTE_GRAY);
+        fillGradient(thumbnail);
+
+        byte[] data = writeSingle(new IIOImage(image, Arrays.asList(thumbnail), null), null, null);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        Directory thumbnailIFD = (Directory) ifd.getEntryById(TIFF.TAG_SUB_IFD).getValue();
+
+        assertEquals(TIFFBaseline.PHOTOMETRIC_BLACK_IS_ZERO, (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_PHOTOMETRIC_INTERPRETATION))[0],
+                     "Thumbnail should keep its own PhotometricInterpretation");
+        assertThumbnailData(data, thumbnailIFD, thumbnail);
+    }
+
     private static class ImageInfo {
         final int width;
         final int height;

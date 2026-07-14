@@ -30,10 +30,14 @@
 
 package com.twelvemonkeys.imageio.plugins.tiff;
 
+import com.twelvemonkeys.imageio.metadata.Directory;
+import com.twelvemonkeys.imageio.metadata.Entry;
 import com.twelvemonkeys.imageio.metadata.tiff.TIFF;
+import com.twelvemonkeys.imageio.metadata.tiff.TIFFReader;
 import com.twelvemonkeys.imageio.stream.ByteArrayImageInputStream;
 import com.twelvemonkeys.imageio.util.ImageWriterAbstractTest;
 
+import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
 import javax.imageio.ImageReader;
 import javax.imageio.spi.ImageWriterSpi;
@@ -41,6 +45,7 @@ import javax.imageio.stream.ImageInputStream;
 import javax.imageio.stream.ImageOutputStream;
 import java.awt.image.BufferedImage;
 import java.awt.image.RenderedImage;
+import java.awt.image.WritableRaster;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.Arrays;
@@ -112,6 +117,59 @@ public class BigTIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWri
         }
         finally {
             reader.dispose();
+        }
+    }
+
+    @Test
+    public void testWriteThumbnail() throws IOException {
+        // NOTE: For BigTIFF, the SubIFDs (330) entry holds 8 byte (LONG8) offsets
+        BufferedImage image = new BufferedImage(90, 60, BufferedImage.TYPE_3BYTE_BGR);
+        BufferedImage thumbnail = new BufferedImage(9, 6, BufferedImage.TYPE_3BYTE_BGR);
+
+        WritableRaster raster = thumbnail.getRaster();
+        for (int y = 0; y < thumbnail.getHeight(); y++) {
+            for (int x = 0; x < thumbnail.getWidth(); x++) {
+                for (int b = 0; b < raster.getNumBands(); b++) {
+                    raster.setSample(x, y, b, (x * 7 + y * 13 + b * 29) * 71 % 256);
+                }
+            }
+        }
+
+        TIFFImageWriter writer = createWriter();
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+
+        try (ImageOutputStream output = ImageIO.createImageOutputStream(bytes)) {
+            writer.setOutput(output);
+            writer.write(null, new IIOImage(image, Arrays.asList(thumbnail), null), null);
+        }
+        finally {
+            writer.dispose();
+        }
+
+        byte[] data = bytes.toByteArray();
+        assertArrayEquals(new byte[] {'M', 'M', 0, TIFF.BIGTIFF_MAGIC}, Arrays.copyOf(data, 4), "Expected BigTIFF output");
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        Entry subIFDEntry = ifd.getEntryById(TIFF.TAG_SUB_IFD);
+        assertNotNull(subIFDEntry, "Missing SubIFDs (330) entry");
+        assertTrue(subIFDEntry.getValue() instanceof Directory, "SubIFDs entry should hold a parsed sub-IFD");
+
+        Directory thumbnailIFD = (Directory) subIFDEntry.getValue();
+        assertEquals(9, ((Number) thumbnailIFD.getEntryById(TIFF.TAG_IMAGE_WIDTH).getValue()).intValue());
+        assertEquals(6, ((Number) thumbnailIFD.getEntryById(TIFF.TAG_IMAGE_HEIGHT).getValue()).intValue());
+        assertEquals(1, ((Number) thumbnailIFD.getEntryById(TIFF.TAG_SUBFILE_TYPE).getValue()).intValue());
+
+        // Verify the thumbnail data, uncompressed, chunky, single strip
+        int offset = ((Number) thumbnailIFD.getEntryById(TIFF.TAG_STRIP_OFFSETS).getValue()).intValue();
+        assertEquals(9L * 6 * 3, ((Number) thumbnailIFD.getEntryById(TIFF.TAG_STRIP_BYTE_COUNTS).getValue()).longValue());
+
+        for (int y = 0, i = offset; y < 6; y++) {
+            for (int x = 0; x < 9; x++) {
+                for (int b = 0; b < 3; b++, i++) {
+                    assertEquals(raster.getSample(x, y, b), data[i] & 0xff,
+                                 String.format("Thumbnail sample at (%d,%d) band %d differs", x, y, b));
+                }
+            }
         }
     }
 }
