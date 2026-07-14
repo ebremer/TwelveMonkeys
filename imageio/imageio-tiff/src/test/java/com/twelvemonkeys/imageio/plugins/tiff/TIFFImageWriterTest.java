@@ -31,6 +31,7 @@
 package com.twelvemonkeys.imageio.plugins.tiff;
 
 import com.twelvemonkeys.imageio.color.ColorSpaces;
+import com.twelvemonkeys.imageio.metadata.CompoundDirectory;
 import com.twelvemonkeys.imageio.metadata.Directory;
 import com.twelvemonkeys.imageio.metadata.Entry;
 import com.twelvemonkeys.imageio.metadata.tiff.Rational;
@@ -2207,6 +2208,178 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
         }
 
         assertSamplesEquals("Tiled JPEG compressed CMYK samples differ", image.getRaster(), readSingleRaw(data).getRaster(), 8);
+    }
+
+    // Pyramid (multi-resolution) writing, via TIFFImageWriteParam
+
+    @Test
+    public void testWritePyramidParam() throws IOException {
+        BufferedImage image = new BufferedImage(600, 400, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(image);
+
+        TIFFImageWriter writer = createWriter();
+        TIFFImageWriteParam param = (TIFFImageWriteParam) writer.getDefaultWriteParam();
+        assertFalse(param.getWritePyramid(), "WritePyramid should be disabled by default");
+        assertEquals(TIFFImageWriteParam.PyramidLayout.SUB_IFDS, param.getPyramidLayout(), "SubIFDs should be the default pyramid layout");
+        param.setWritePyramid(true);
+        writer.dispose();
+
+        byte[] data = writeSingle(image, param);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+
+        // Pyramid writing defaults to a tiled layout
+        assertEquals(256, (int) longs(ifd.getEntryById(TIFF.TAG_TILE_WIDTH))[0]);
+
+        // Levels are halved until they fit within a single tile: 600 x 400 -> 300 x 200 -> 150 x 100
+        Entry subIFDEntry = ifd.getEntryById(TIFF.TAG_SUB_IFD);
+        assertNotNull(subIFDEntry, "Missing SubIFDs (330) entry");
+
+        Object subIFDValue = subIFDEntry.getValue();
+        assertTrue(subIFDValue instanceof Directory[], "SubIFDs entry should hold parsed sub-IFDs, was: " + subIFDValue.getClass());
+
+        Directory[] levels = (Directory[]) subIFDValue;
+        assertEquals(2, levels.length, "Unexpected number of levels");
+
+        assertEquals(300, (int) longs(levels[0].getEntryById(TIFF.TAG_IMAGE_WIDTH))[0]);
+        assertEquals(200, (int) longs(levels[0].getEntryById(TIFF.TAG_IMAGE_HEIGHT))[0]);
+        assertEquals(TIFFBaseline.FILETYPE_REDUCEDIMAGE, (int) longs(levels[0].getEntryById(TIFF.TAG_SUBFILE_TYPE))[0],
+                     "Level should be marked reduced-resolution (NewSubfileType 1)");
+        assertEquals(150, (int) longs(levels[1].getEntryById(TIFF.TAG_IMAGE_WIDTH))[0]);
+        assertEquals(100, (int) longs(levels[1].getEntryById(TIFF.TAG_IMAGE_HEIGHT))[0]);
+
+        // The levels must not appear as pages, and the main image must be unaffected
+        try (ImageInputStream input = new ByteArrayImageInputStream(data)) {
+            ImageReader reader = ImageIO.getImageReaders(input).next();
+
+            try {
+                reader.setInput(input);
+
+                assertEquals(1, reader.getNumImages(true), "Levels should not be part of the main IFD chain");
+                assertImageEquals("Main image differs", image, reader.read(0), 0);
+            }
+            finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    @Test
+    public void testWritePyramidParamPagesLayoutUncompressed() throws IOException {
+        // The uncompressed pages layout exercises the path where the IFD is written before the image data
+        BufferedImage image = new BufferedImage(600, 400, BufferedImage.TYPE_BYTE_GRAY);
+        fillGradient(image);
+
+        TIFFImageWriter writer = createWriter();
+        TIFFImageWriteParam param = (TIFFImageWriteParam) writer.getDefaultWriteParam();
+        param.setWritePyramid(true);
+        param.setPyramidLayout(TIFFImageWriteParam.PyramidLayout.PAGES);
+        writer.dispose();
+
+        byte[] data = writeSingle(image, param);
+
+        // The levels are pages in the main IFD chain: 600 x 400 -> 300 x 200 -> 150 x 100
+        CompoundDirectory pages = (CompoundDirectory) new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertEquals(3, pages.directoryCount());
+
+        assertNull(pages.getDirectory(0).getEntryById(TIFF.TAG_SUB_IFD), "Pages layout should not write SubIFDs");
+        assertEquals(300, (int) longs(pages.getDirectory(1).getEntryById(TIFF.TAG_IMAGE_WIDTH))[0]);
+        assertEquals(TIFFBaseline.FILETYPE_REDUCEDIMAGE, (int) longs(pages.getDirectory(1).getEntryById(TIFF.TAG_SUBFILE_TYPE))[0],
+                     "Level page should be marked reduced-resolution (NewSubfileType 1)");
+        assertEquals(150, (int) longs(pages.getDirectory(2).getEntryById(TIFF.TAG_IMAGE_WIDTH))[0]);
+
+        try (ImageInputStream input = new ByteArrayImageInputStream(data)) {
+            ImageReader reader = ImageIO.getImageReaders(input).next();
+
+            try {
+                reader.setInput(input);
+
+                assertEquals(3, reader.getNumImages(true), "Levels should be pages in the main IFD chain");
+                assertImageEquals("Main image differs", image, reader.read(0), 0);
+                assertEquals(300, reader.getWidth(1));
+                assertEquals(150, reader.getWidth(2));
+            }
+            finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    /**
+     * Independent reference implementation of the 2 x 2 box filter used for the pyramid levels:
+     * Averages (rounded) each 2 x 2 block, with the dimensions rounded up, clamping at the edges.
+     */
+    private static BufferedImage boxAverageHalf(final BufferedImage image) {
+        int sourceWidth = image.getWidth();
+        int sourceHeight = image.getHeight();
+        int width = (sourceWidth + 1) / 2;
+        int height = (sourceHeight + 1) / 2;
+
+        BufferedImage half = new BufferedImage(width, height, image.getType());
+        Raster source = image.getRaster();
+        WritableRaster destination = half.getRaster();
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                for (int b = 0; b < source.getNumBands(); b++) {
+                    int sum = 0;
+                    int count = 0;
+
+                    for (int dy = 0; dy < 2; dy++) {
+                        for (int dx = 0; dx < 2; dx++) {
+                            int sampleX = 2 * x + dx;
+                            int sampleY = 2 * y + dy;
+
+                            if (sampleX < sourceWidth && sampleY < sourceHeight) {
+                                sum += source.getSample(sampleX, sampleY, b);
+                                count++;
+                            }
+                        }
+                    }
+
+                    destination.setSample(x, y, b, (sum + count / 2) / count);
+                }
+            }
+        }
+
+        return half;
+    }
+
+    @Test
+    public void testWritePyramidLevelsAreBoxAveraged() throws IOException {
+        // NOTE: Odd dimensions, to exercise the edge handling of the box filter.
+        // The pages layout is used, as it makes the levels directly readable as pages: 601 x 403 -> 301 x 202 -> 151 x 101
+        BufferedImage image = new BufferedImage(601, 403, BufferedImage.TYPE_3BYTE_BGR);
+        fillGradient(image);
+
+        TIFFImageWriter writer = createWriter();
+        TIFFImageWriteParam param = (TIFFImageWriteParam) writer.getDefaultWriteParam();
+        param.setWritePyramid(true);
+        param.setPyramidLayout(TIFFImageWriteParam.PyramidLayout.PAGES);
+        writer.dispose();
+
+        byte[] data = writeSingle(image, param);
+
+        BufferedImage expectedLevel1 = boxAverageHalf(image);
+        BufferedImage expectedLevel2 = boxAverageHalf(expectedLevel1);
+
+        try (ImageInputStream input = new ByteArrayImageInputStream(data)) {
+            ImageReader reader = ImageIO.getImageReaders(input).next();
+
+            try {
+                reader.setInput(input);
+
+                assertEquals(3, reader.getNumImages(true));
+                assertImageEquals("Full resolution image differs", image, reader.read(0), 0);
+
+                // Each level must be the 2 x 2 box average of the previous one, sample for sample
+                assertSamplesEquals("Level 1 is not a 2 x 2 box average of the image", expectedLevel1.getRaster(), reader.read(1).getRaster());
+                assertSamplesEquals("Level 2 is not a 2 x 2 box average of level 1", expectedLevel2.getRaster(), reader.read(2).getRaster());
+            }
+            finally {
+                reader.dispose();
+            }
+        }
     }
 
     private static class ImageInfo {

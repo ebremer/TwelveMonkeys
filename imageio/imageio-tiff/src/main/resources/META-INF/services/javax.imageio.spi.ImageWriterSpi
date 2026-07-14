@@ -1,2 +1,4 @@
 com.twelvemonkeys.imageio.plugins.tiff.TIFFImageWriterSpi
 com.twelvemonkeys.imageio.plugins.tiff.BigTIFFImageWriterSpi
+com.twelvemonkeys.imageio.plugins.tiff.PyramidalTIFFImageWriterSpi
+com.twelvemonkeys.imageio.plugins.tiff.PyramidalBigTIFFImageWriterSpi

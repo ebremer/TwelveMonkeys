@@ -64,10 +64,13 @@ import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.zip.Deflater;
 import java.util.zip.DeflaterOutputStream;
@@ -82,7 +85,7 @@ import static com.twelvemonkeys.imageio.plugins.tiff.TIFFStreamMetadata.configur
  * @author last modified by $Author: haraldk$
  * @version $Id: TIFFImageWriter.java,v 1.0 18.09.13 12:46 haraldk Exp$
  */
-public final class TIFFImageWriter extends ImageWriterBase {
+public class TIFFImageWriter extends ImageWriterBase {
     // Long term
     // TODO: Support use-case: Transcode multi-layer PSD to multi-page TIFF with metadata (hard, as Photoshop don't store layers as multi-page TIFF...)
     // TODO: Support use-case: Transcode multi-page TIFF to multiple single-page TIFFs with metadata
@@ -112,9 +115,17 @@ public final class TIFFImageWriter extends ImageWriterBase {
     // Support planar (PlanarConfiguration 2) writing, controlled by the image metadata
     // Support thumbnails, written as reduced-resolution images in SubIFDs (tag 330)
     // Support JPEG compression of CMYK data (written as a raster, photometric Separated, as in TIFF Technote 2)
+    // Support pyramidal TIFF, reduced-resolution levels in SubIFDs (tag 330) or as chained pages,
+    // controlled by TIFFImageWriteParam.setWritePyramid/setPyramidLayout
 
     /** The TIFF 6.0 spec recommends writing strips of about 8K bytes (before compression). */
     private static final long DEFAULT_STRIP_SIZE = 8L * 1024;
+
+    /** Default tile size for pyramid writing, unless the param specifies explicit tiling. */
+    private static final int DEFAULT_TILE_SIZE = 256;
+
+    /** No SubIFDs (tag 330). */
+    private static final long[] NO_SUB_IFDS = {};
 
     private final SequenceSupport sequence = new SequenceSupport();
 
@@ -196,13 +207,14 @@ public final class TIFFImageWriter extends ImageWriterBase {
         long[] segmentOffsets = new long[planes * layout.segsAcross * layout.segsDown];
         long[] segmentByteCounts = new long[segmentOffsets.length];
 
-        // Thumbnails are written as reduced-resolution images in SubIFDs (tag 330), after the image data.
-        // As their offsets are unknown until they are written, the IFD can't be written up front
-        boolean hasThumbnails = image.getNumThumbnails() > 0;
+        // Pyramid levels and thumbnails are written as reduced-resolution images in SubIFDs (tag 330),
+        // after the image data. As their offsets are unknown until they are written, the IFD can't be
+        // written up front in that case
+        boolean hasSubIFDs = hasSubIFDs(image, renderedImage, param);
 
         long nextIFDPointerOffset;
 
-        if (compression == TIFFBaseline.COMPRESSION_NONE && !hasThumbnails) {
+        if (compression == TIFFBaseline.COMPRESSION_NONE && !hasSubIFDs) {
             // Uncompressed data has predictable size, so we write the IFD before the image data.
             // This implementation allows semi-streaming-compatible uncompressed TIFFs
             padToWordBoundary();
@@ -244,7 +256,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
             tiffWriter.writeOffset(imageOutput, 0); // Update next IFD pointer later
 
             // The image data follows the IFD directly
-            writeSegments(imageIndex, renderedImage, param, entries, layout, planar, segmentOffsets, segmentByteCounts);
+            writeSegmentData(imageIndex, image, renderedImage, param, entries, layout, planar, segmentOffsets, segmentByteCounts, true);
 
             // Link the previous IFD pointer (or the stream header) to the IFD just written.
             // NOTE: When at the start of the chain, writeIFD has already written the pointer, rewriting it is harmless
@@ -260,20 +272,15 @@ public final class TIFFImageWriter extends ImageWriterBase {
             }
 
             // Write the image data, one segment (strip or tile) at a time, collecting offsets and byte counts
-            if (compression == TIFFExtension.COMPRESSION_JPEG) {
-                // NOTE: JPEG compressed data is always written chunky (guarded by canWritePlanar)
-                writeJPEGSegments(imageIndex, image, renderedImage, param, layout, segmentOffsets, segmentByteCounts);
-            }
-            else {
-                writeSegments(imageIndex, renderedImage, param, entries, layout, planar, segmentOffsets, segmentByteCounts);
-            }
+            writeSegmentData(imageIndex, image, renderedImage, param, entries, layout, planar, segmentOffsets, segmentByteCounts, true);
 
             putSegmentEntries(entries, layout.tiled, offsetType, segmentOffsets, segmentByteCounts);
 
-            // Write the thumbnails as reduced-resolution images in SubIFDs (tag 330, as in TIFF/EP and DNG)
-            if (hasThumbnails) {
-                long[] subIFDOffsets = writeThumbnails(imageIndex, image, tiffWriter, offsetType);
+            // Write the reduced-resolution images (pyramid levels and/or thumbnails)
+            // in SubIFDs (tag 330, as in TIFF/EP and DNG)
+            long[] subIFDOffsets = writeSubIFDs(imageIndex, image, renderedImage, param, tiffWriter, offsetType);
 
+            if (subIFDOffsets.length > 0) {
                 entries.put(TIFF.TAG_SUB_IFD, new TIFFEntry(TIFF.TAG_SUB_IFD, offsetType,
                                                             subIFDOffsets.length == 1 ? subIFDOffsets[0] : subIFDOffsets));
             }
@@ -291,6 +298,14 @@ public final class TIFFImageWriter extends ImageWriterBase {
             tiffWriter.writeOffset(imageOutput, ifdPointer);
             imageOutput.seek(endPosition);
         }
+
+        // Append the reduced-resolution levels as pages in the main IFD chain (PyramidLayout.PAGES)
+        if (writesPyramid(param) && isPagesLayout(param)) {
+            nextIFDPointerOffset = writeLevelPages(imageIndex, renderedImage, param, tiffWriter, nextIFDPointerOffset);
+        }
+
+        // NOTE: The image is not complete until its levels and thumbnails are written
+        processImageComplete();
 
         return nextIFDPointerOffset;
     }
@@ -364,12 +379,410 @@ public final class TIFFImageWriter extends ImageWriterBase {
     }
 
     /**
+     * Writes the image data, one segment (strip or tile) at a time, and stores the offsets and byte
+     * counts of the segments written.
+     *
+     * @param notifyProgress {@code false} for reduced-resolution images, which fire no progress events.
+     */
+    private void writeSegmentData(final int imageIndex, final IIOImage image, final RenderedImage renderedImage,
+                                  final ImageWriteParam param, final Map<Integer, Entry> entries,
+                                  final SegmentLayout layout, final boolean planar,
+                                  final long[] segmentOffsets, final long[] segmentByteCounts,
+                                  final boolean notifyProgress) throws IOException {
+        int compression = ((Number) entries.get(TIFF.TAG_COMPRESSION).getValue()).intValue();
+
+        if (compression == TIFFExtension.COMPRESSION_JPEG) {
+            // NOTE: JPEG compressed data is always written chunky (guarded by canWritePlanar)
+            writeJPEGSegments(imageIndex, image, renderedImage, param, layout, segmentOffsets, segmentByteCounts, notifyProgress);
+        }
+        else {
+            writeSegments(imageIndex, renderedImage, param, entries, layout, planar, segmentOffsets, segmentByteCounts, notifyProgress);
+        }
+    }
+
+    /**
+     * Returns whether a pyramid (reduced-resolution levels) will be written.
+     * This implementation returns the value of the param's {@code WritePyramid} setting.
+     *
+     * @see TIFFImageWriteParam#setWritePyramid(boolean)
+     */
+    boolean writesPyramid(final ImageWriteParam param) {
+        return TIFFImageWriteParam.isWritePyramid(param);
+    }
+
+    /**
+     * Returns whether the pyramid levels are written as pages (top-level IFDs in the main IFD chain),
+     * instead of the default SubIFDs (tag 330).
+     *
+     * @see TIFFImageWriteParam#setPyramidLayout(TIFFImageWriteParam.PyramidLayout)
+     */
+    private static boolean isPagesLayout(final ImageWriteParam param) {
+        return TIFFImageWriteParam.getPyramidLayout(param) == TIFFImageWriteParam.PyramidLayout.PAGES;
+    }
+
+    /**
+     * Returns a param with explicit {@code DEFAULT_TILE_SIZE} tiling when writing a pyramid, unless
+     * tiling is already explicitly enabled or disabled in the given param (a pyramid without tiles
+     * gives no random access benefit, so a tiled layout is the pyramid default).
+     * When not writing a pyramid, the param is returned unchanged.
+     */
+    private ImageWriteParam pyramidParam(final ImageWriteParam param) {
+        if (!writesPyramid(param)) {
+            return param;
+        }
+
+        if (param != null && param.canWriteTiles()
+                && (param.getTilingMode() == ImageWriteParam.MODE_EXPLICIT || param.getTilingMode() == ImageWriteParam.MODE_DISABLED)) {
+            // Explicit tile size, or explicitly disabled (strips): Use as-is
+            return param;
+        }
+
+        TIFFImageWriteParam tiled = new TIFFImageWriteParam();
+        tiled.setWritePyramid(true);
+        tiled.setPyramidLayout(TIFFImageWriteParam.getPyramidLayout(param));
+
+        if (param != null && param.canWriteCompressed()) {
+            tiled.setCompressionMode(param.getCompressionMode());
+
+            if (param.getCompressionMode() == ImageWriteParam.MODE_EXPLICIT) {
+                tiled.setCompressionType(param.getCompressionType());
+                tiled.setCompressionQuality(param.getCompressionQuality());
+            }
+        }
+
+        tiled.setTilingMode(ImageWriteParam.MODE_EXPLICIT);
+        tiled.setTiling(DEFAULT_TILE_SIZE, DEFAULT_TILE_SIZE, 0, 0);
+
+        return tiled;
+    }
+
+    /**
+     * Returns the size limit for the smallest pyramid level:
+     * Levels are generated until both dimensions fit within a single tile.
+     */
+    private static int maxLevelSize(final ImageWriteParam param) {
+        if (param != null && param.canWriteTiles() && param.getTilingMode() == ImageWriteParam.MODE_EXPLICIT) {
+            // Match the tile size rounding of the page writing (multiples of 16)
+            int tileWidth = (Math.max(1, param.getTileWidth()) + 15) / 16 * 16;
+            int tileHeight = (Math.max(1, param.getTileHeight()) + 15) / 16 * 16;
+
+            return Math.max(tileWidth, tileHeight);
+        }
+
+        return DEFAULT_TILE_SIZE;
+    }
+
+    /**
+     * Returns whether writing {@code image} will produce SubIFDs (tag 330):
+     * Thumbnails, or pyramid levels if pyramid writing with SubIFD layout is enabled.
+     */
+    private boolean hasSubIFDs(final IIOImage image, final RenderedImage renderedImage, final ImageWriteParam param) {
+        if (image.getNumThumbnails() > 0) {
+            return true;
+        }
+
+        if (!writesPyramid(param) || isPagesLayout(param)) {
+            return false;
+        }
+
+        int limit = maxLevelSize(param);
+
+        return renderedImage.getWidth() > limit || renderedImage.getHeight() > limit;
+    }
+
+    /**
+     * Writes all reduced-resolution images for the given image, for use as SubIFDs (tag 330):
+     * The pyramid levels (if pyramid writing is enabled), followed by the image's thumbnails.
+     *
+     * @return the IFD offsets of the pages written, possibly empty, never {@code null}.
+     */
+    private long[] writeSubIFDs(final int imageIndex, final IIOImage image, final RenderedImage renderedImage,
+                                final ImageWriteParam param, final TIFFWriter tiffWriter, final short offsetType) throws IOException {
+        // Write the reduced-resolution levels, halving until a level fits within a single tile.
+        // Each level is generated from the previous, keeping at most two levels in memory
+        List<Long> levelOffsets = new ArrayList<>();
+
+        if (writesPyramid(param) && !isPagesLayout(param)) {
+            int limit = maxLevelSize(param);
+            RenderedImage level = renderedImage;
+
+            while (level.getWidth() > limit || level.getHeight() > limit) {
+                level = halve(level);
+                levelOffsets.add(writeSubIFDPage(imageIndex, level, param, tiffWriter));
+            }
+        }
+
+        // The thumbnails follow the levels in the SubIFDs array
+        long[] thumbnailOffsets = image.getNumThumbnails() > 0
+                                  ? writeThumbnails(imageIndex, image, tiffWriter, offsetType)
+                                  : NO_SUB_IFDS;
+
+        if (levelOffsets.isEmpty()) {
+            return thumbnailOffsets;
+        }
+
+        long[] offsets = new long[levelOffsets.size() + thumbnailOffsets.length];
+
+        for (int i = 0; i < levelOffsets.size(); i++) {
+            offsets[i] = levelOffsets.get(i);
+        }
+
+        System.arraycopy(thumbnailOffsets, 0, offsets, levelOffsets.size(), thumbnailOffsets.length);
+
+        return offsets;
+    }
+
+    /**
+     * Writes a complete reduced-resolution page (image data and IFD) for use as a SubIFD (tag 330).
+     * The page's next-IFD pointer is terminated, and it is not linked into the main IFD chain.
+     *
+     * @return the offset of the IFD written.
+     */
+    private long writeSubIFDPage(final int imageIndex, final RenderedImage image, final ImageWriteParam param, final TIFFWriter tiffWriter) throws IOException {
+        long ifdOffset = writeReducedResolutionPage(imageIndex, image, param, tiffWriter);
+        tiffWriter.writeOffset(imageOutput, 0); // SubIFD pages are not chained
+
+        return ifdOffset;
+    }
+
+    /**
+     * Writes the reduced-resolution levels as pages, linked into the main IFD chain
+     * ({@link TIFFImageWriteParam.PyramidLayout#PAGES}), halving until a level fits within a single
+     * tile. Each level is generated from the previous, keeping at most two levels in memory.
+     * Each page's next-IFD pointer is terminated before the page is linked to its predecessor,
+     * keeping the chain valid if writing fails.
+     *
+     * @return the offset of the next-IFD pointer of the last page written.
+     */
+    private long writeLevelPages(final int imageIndex, final RenderedImage image, final ImageWriteParam param,
+                                 final TIFFWriter tiffWriter, final long lastIFDPointerOffset) throws IOException {
+        int limit = maxLevelSize(param);
+
+        RenderedImage level = image;
+        long pointerOffset = lastIFDPointerOffset;
+
+        while (level.getWidth() > limit || level.getHeight() > limit) {
+            level = halve(level);
+
+            long ifdOffset = writeReducedResolutionPage(imageIndex, level, param, tiffWriter);
+            long nextIFDPointerOffset = imageOutput.getStreamPosition();
+            tiffWriter.writeOffset(imageOutput, 0);
+
+            // Link the previous page to the level page just written
+            long endPosition = imageOutput.getStreamPosition();
+            imageOutput.seek(pointerOffset);
+            tiffWriter.writeOffset(imageOutput, ifdOffset);
+            imageOutput.seek(endPosition);
+
+            pointerOffset = nextIFDPointerOffset;
+        }
+
+        return pointerOffset;
+    }
+
+    /**
+     * Writes a complete reduced-resolution page (image data and IFD).
+     * The page is marked with NewSubfileType 1 (reduced-resolution image), and written with the
+     * compression and tiling of the param, always chunky (PlanarConfiguration 1).
+     * No progress events are fired.
+     * NOTE: The next-IFD pointer is <em>not</em> written, the caller must write or link it.
+     *
+     * @return the offset of the IFD written.
+     */
+    private long writeReducedResolutionPage(final int imageIndex, final RenderedImage image,
+                                            final ImageWriteParam param, final TIFFWriter tiffWriter) throws IOException {
+        ImageTypeSpecifier spec = ImageTypeSpecifiers.createFromRenderedImage(image);
+        TIFFImageMetadata metadata = getDefaultImageMetadata(spec, param);
+
+        Map<Integer, Entry> entries = new LinkedHashMap<>();
+        for (Entry entry : metadata.getIFD()) {
+            entries.put((Integer) entry.getIdentifier(), entry);
+        }
+
+        int width = image.getWidth();
+        int height = image.getHeight();
+
+        entries.put(TIFF.TAG_SUBFILE_TYPE, new TIFFEntry(TIFF.TAG_SUBFILE_TYPE, TIFF.TYPE_LONG, TIFFBaseline.FILETYPE_REDUCEDIMAGE));
+        entries.put(TIFF.TAG_IMAGE_WIDTH, new TIFFEntry(TIFF.TAG_IMAGE_WIDTH, width));
+        entries.put(TIFF.TAG_IMAGE_HEIGHT, new TIFFEntry(TIFF.TAG_IMAGE_HEIGHT, height));
+
+        SegmentLayout layout = computeSegmentLayout(imageIndex, param, entries, image.getSampleModel(), width, height, false);
+
+        short offsetType = tiffWriter.offsetSize() == 4 ? TIFF.TYPE_LONG : TIFF.TYPE_LONG8;
+        long[] segmentOffsets = new long[layout.segsAcross * layout.segsDown];
+        long[] segmentByteCounts = new long[segmentOffsets.length];
+
+        writeSegmentData(imageIndex, new IIOImage(image, null, null), image, param, entries,
+                         layout, false, segmentOffsets, segmentByteCounts, false);
+
+        putSegmentEntries(entries, layout.tiled, offsetType, segmentOffsets, segmentByteCounts);
+
+        padToWordBoundary();
+
+        return tiffWriter.writeIFD(entries.values(), imageOutput); // NOTE: Writer takes care of ordering tags
+    }
+
+    /**
+     * Creates a half-resolution (dimensions rounded up) version of the given image,
+     * keeping the color model and sample layout.
+     * Samples are averaged using a 2 x 2 box filter, except palette indices and sub-byte samples,
+     * where every other sample is used (nearest-neighbor).
+     */
+    private static BufferedImage halve(final RenderedImage source) {
+        return new Halver(source).halve();
+    }
+
+    /**
      * Pads the output to a word (2 byte) boundary, as required for IFDs and value offsets
      * (TIFF 6.0 Specification, "Image File Directory", page 13-15).
      */
     private void padToWordBoundary() throws IOException {
         if ((imageOutput.getStreamPosition() & 1) != 0) {
             imageOutput.write(0);
+        }
+    }
+
+    /**
+     * Downsamples a {@link RenderedImage} to half resolution (dimensions rounded up), keeping the
+     * color model and sample layout. Samples are averaged using a 2 x 2 box filter, except palette
+     * indices and sub-byte samples, where every other sample is used (nearest-neighbor).
+     * <p>
+     * Implemented as a method object, so that the per-band row helpers can share the destination,
+     * geometry and reusable scratch buffers as fields, instead of threading them through long
+     * parameter lists. The source is read one stripe (of whole, even tile rows) at a time, so at
+     * most one stripe plus the half-size result is held in memory.
+     * </p>
+     */
+    private static final class Halver {
+        private final RenderedImage source;
+        private final ColorModel colorModel;
+        private final SampleModel sampleModel;
+        private final WritableRaster destination;
+
+        private final int sourceWidth;
+        private final int sourceHeight;
+        private final int width;
+        private final int sourceMinX;
+        private final int sourceMinY;
+        private final int numBands;
+        private final int stripeHeight;
+
+        private final boolean average;
+
+        // Reused per-row scratch buffers
+        private final int[] row0;
+        private final int[] row1;
+        private final int[] destRow;
+
+        // Source samples for the stripe currently being processed
+        private Raster data;
+
+        Halver(final RenderedImage source) {
+            this.source = source;
+
+            sourceWidth = source.getWidth();
+            sourceHeight = source.getHeight();
+            width = Math.max(1, (sourceWidth + 1) / 2);
+            int height = Math.max(1, (sourceHeight + 1) / 2);
+
+            colorModel = source.getColorModel();
+            sampleModel = source.getSampleModel();
+            destination = Raster.createWritableRaster(sampleModel.createCompatibleSampleModel(width, height), null);
+
+            // Palette indices and sub-byte samples can't be averaged
+            average = !(colorModel instanceof IndexColorModel) && sampleModel.getSampleSize(0) >= 8;
+
+            sourceMinX = source.getMinX();
+            sourceMinY = source.getMinY();
+            numBands = sampleModel.getNumBands();
+
+            // A BufferedImage source is fully in memory already, process it as a single stripe.
+            // For other sources, fetch stripes of whole (even) tile rows, to avoid repeated tile computation
+            data = source instanceof BufferedImage ? ((BufferedImage) source).getRaster() : null;
+            stripeHeight = data != null
+                           ? sourceHeight
+                           : Math.min(sourceHeight, Math.max(2, (source.getTileHeight() + 1) / 2 * 2));
+
+            row0 = new int[sourceWidth];
+            row1 = new int[sourceWidth];
+            destRow = new int[width];
+        }
+
+        BufferedImage halve() {
+            boolean wholeImageInMemory = data != null;
+
+            for (int stripeY = 0; stripeY < sourceHeight; stripeY += stripeHeight) {
+                int rows = Math.min(stripeHeight, sourceHeight - stripeY);
+
+                if (!wholeImageInMemory) {
+                    data = source.getData(new Rectangle(sourceMinX, sourceMinY + stripeY, sourceWidth, rows));
+                }
+
+                for (int y = stripeY / 2; y < (stripeY + rows + 1) / 2; y++) {
+                    int sampleY = sourceMinY + 2 * y;
+                    // Next source row, within both the image and the stripe (stripes are even-sized)
+                    boolean hasNextRow = 2 * y + 1 < stripeY + rows;
+
+                    for (int band = 0; band < numBands; band++) {
+                        if (average) {
+                            averageBand(band, y, sampleY, hasNextRow);
+                        }
+                        else {
+                            subsampleBand(band, y, sampleY);
+                        }
+                    }
+                }
+            }
+
+            return new BufferedImage(colorModel, destination, colorModel.isAlphaPremultiplied(), null);
+        }
+
+        /** Nearest-neighbor: use every other sample of the source row. */
+        private void subsampleBand(final int band, final int destY, final int sampleY) {
+            data.getSamples(sourceMinX, sampleY, sourceWidth, 1, band, row0);
+
+            for (int x = 0; x < width; x++) {
+                destRow[x] = row0[2 * x];
+            }
+
+            destination.setSamples(0, destY, width, 1, band, destRow);
+        }
+
+        /** 2 x 2 box average (rounded, 32 bit samples treated as unsigned). */
+        private void averageBand(final int band, final int destY, final int sampleY, final boolean hasNextRow) {
+            // 32 bit samples are unsigned (SampleFormat 1) and must not be sign extended
+            long mask = sampleModel.getSampleSize(band) == 32 ? 0xFFFFFFFFL : -1L;
+
+            data.getSamples(sourceMinX, sampleY, sourceWidth, 1, band, row0);
+            if (hasNextRow) {
+                data.getSamples(sourceMinX, sampleY + 1, sourceWidth, 1, band, row1);
+            }
+
+            for (int x = 0; x < width; x++) {
+                int sampleX = 2 * x;
+                boolean hasNextColumn = sampleX + 1 < sourceWidth;
+
+                long sum = row0[sampleX] & mask;
+                int count = 1;
+
+                if (hasNextColumn) {
+                    sum += row0[sampleX + 1] & mask;
+                    count++;
+                }
+                if (hasNextRow) {
+                    sum += row1[sampleX] & mask;
+                    count++;
+
+                    if (hasNextColumn) {
+                        sum += row1[sampleX + 1] & mask;
+                        count++;
+                    }
+                }
+
+                destRow[x] = (int) ((sum + count / 2) / count);
+            }
+
+            destination.setSamples(0, destY, width, 1, band, destRow);
         }
     }
 
@@ -675,8 +1088,11 @@ public final class TIFFImageWriter extends ImageWriterBase {
      */
     private void writeSegments(final int imageIndex, final RenderedImage image, final ImageWriteParam param, final Map<Integer, Entry> entries,
                                final SegmentLayout layout, final boolean planar,
-                               final long[] segmentOffsets, final long[] segmentByteCounts) throws IOException {
-        processImageStarted(imageIndex);
+                               final long[] segmentOffsets, final long[] segmentByteCounts,
+                               final boolean notifyProgress) throws IOException {
+        if (notifyProgress) {
+            processImageStarted(imageIndex);
+        }
 
         int width = image.getWidth();
         int height = image.getHeight();
@@ -734,12 +1150,12 @@ public final class TIFFImageWriter extends ImageWriterBase {
                     segmentByteCounts[segment] = imageOutput.getStreamPosition() - segmentOffsets[segment];
                     segment++;
 
-                    processImageProgress(segment * 100f / segmentOffsets.length);
+                    if (notifyProgress) {
+                        processImageProgress(segment * 100f / segmentOffsets.length);
+                    }
                 }
             }
         }
-
-        processImageComplete();
     }
 
     /**
@@ -933,7 +1349,8 @@ public final class TIFFImageWriter extends ImageWriterBase {
      * tiled JPEG data is written as one JPEG stream per tile.
      */
     private void writeJPEGSegments(final int imageIndex, final IIOImage image, final RenderedImage renderedImage, final ImageWriteParam param,
-                                   final SegmentLayout layout, final long[] segmentOffsets, final long[] segmentByteCounts) throws IOException {
+                                   final SegmentLayout layout, final long[] segmentOffsets, final long[] segmentByteCounts,
+                                   final boolean notifyProgress) throws IOException {
         // TODO: Cache JPEGImageWriter, dispose in dispose() method
 
         // CMYK data can't be JPEG encoded as an image, as the JPEG writers support gray and RGB color
@@ -950,8 +1367,10 @@ public final class TIFFImageWriter extends ImageWriterBase {
 
                 jpegWriter.setOutput(new SubImageOutputStream(imageOutput));
                 ListenerDelegate listener = new ListenerDelegate(imageIndex);
-                jpegWriter.addIIOWriteProgressListener(listener);
                 jpegWriter.addIIOWriteWarningListener(listener);
+                if (notifyProgress) {
+                    jpegWriter.addIIOWriteProgressListener(listener);
+                }
 
                 IIOImage jpegImage = cmyk ? new IIOImage(rasterOf(renderedImage), null, null) : imageOnly(image);
                 jpegWriter.write(null, jpegImage, copyParams(param, jpegWriter));
@@ -959,7 +1378,9 @@ public final class TIFFImageWriter extends ImageWriterBase {
                 segmentByteCounts[0] = imageOutput.getStreamPosition() - segmentOffsets[0];
             }
             else {
-                processImageStarted(imageIndex);
+                if (notifyProgress) {
+                    processImageStarted(imageIndex);
+                }
 
                 int width = renderedImage.getWidth();
                 int height = renderedImage.getHeight();
@@ -990,11 +1411,11 @@ public final class TIFFImageWriter extends ImageWriterBase {
                         segmentByteCounts[segment] = imageOutput.getStreamPosition() - segmentOffsets[segment];
                         segment++;
 
-                        processImageProgress(segment * 100f / segmentOffsets.length);
+                        if (notifyProgress) {
+                            processImageProgress(segment * 100f / segmentOffsets.length);
+                        }
                     }
                 }
-
-                processImageComplete();
             }
         }
         finally {
@@ -1370,7 +1791,8 @@ public final class TIFFImageWriter extends ImageWriterBase {
     }
 
     private boolean isBigTIFF() throws IOException {
-        return "bigtiff".equalsIgnoreCase(getFormatName());
+        // Matches both "bigtiff" and "pyramidal-bigtiff"
+        return getFormatName().toLowerCase(Locale.ROOT).endsWith("bigtiff");
     }
 
     @Override
@@ -1382,7 +1804,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
             imageOutput.seek(imageOutput.length());
         }
 
-        sequenceLastIFDPos = writePage(sequenceIndex, image, param, sequenceTIFFWriter, sequenceLastIFDPos);
+        sequenceLastIFDPos = writePage(sequenceIndex, image, pyramidParam(param), sequenceTIFFWriter, sequenceLastIFDPos);
     }
 
     @Override
@@ -1551,7 +1973,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
 
         @Override
         public void imageComplete(ImageWriter source) {
-            processImageComplete();
+            // NOTE: Intentionally not forwarded, processImageComplete is fired once per page, in writePage
         }
 
         @Override
