@@ -30,6 +30,7 @@
 
 package com.twelvemonkeys.imageio.plugins.tiff;
 
+import com.twelvemonkeys.imageio.color.ColorSpaces;
 import com.twelvemonkeys.imageio.metadata.Directory;
 import com.twelvemonkeys.imageio.metadata.Entry;
 import com.twelvemonkeys.imageio.metadata.tiff.Rational;
@@ -45,6 +46,7 @@ import org.w3c.dom.NodeList;
 
 import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
+import javax.imageio.ImageReadParam;
 import javax.imageio.ImageReader;
 import javax.imageio.ImageTypeSpecifier;
 import javax.imageio.ImageWriteParam;
@@ -1645,6 +1647,10 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
     // 16 bit multi-channel support
 
     private static void assertSamplesEquals(final String message, final Raster expected, final Raster actual) {
+        assertSamplesEquals(message, expected, actual, 0);
+    }
+
+    private static void assertSamplesEquals(final String message, final Raster expected, final Raster actual, final int tolerance) {
         assertEquals(expected.getWidth(), actual.getWidth(), message + ", widths differ");
         assertEquals(expected.getHeight(), actual.getHeight(), message + ", heights differ");
         assertEquals(expected.getNumBands(), actual.getNumBands(), message + ", band count differs");
@@ -1652,9 +1658,12 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
         for (int y = 0; y < expected.getHeight(); y++) {
             for (int x = 0; x < expected.getWidth(); x++) {
                 for (int b = 0; b < expected.getNumBands(); b++) {
-                    assertEquals(expected.getSample(expected.getMinX() + x, expected.getMinY() + y, b),
-                                 actual.getSample(actual.getMinX() + x, actual.getMinY() + y, b),
-                                 String.format("%s, sample at (%d,%d) band %d differs", message, x, y, b));
+                    int expectedSample = expected.getSample(expected.getMinX() + x, expected.getMinY() + y, b);
+                    int actualSample = actual.getSample(actual.getMinX() + x, actual.getMinY() + y, b);
+
+                    assertTrue(Math.abs(expectedSample - actualSample) <= tolerance,
+                               String.format("%s, sample at (%d,%d) band %d differs: expected %d +/- %d, was %d",
+                                             message, x, y, b, expectedSample, tolerance, actualSample));
                 }
             }
         }
@@ -2053,6 +2062,151 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
         assertEquals(TIFFBaseline.PHOTOMETRIC_BLACK_IS_ZERO, (int) longs(thumbnailIFD.getEntryById(TIFF.TAG_PHOTOMETRIC_INTERPRETATION))[0],
                      "Thumbnail should keep its own PhotometricInterpretation");
         assertThumbnailData(data, thumbnailIFD, thumbnail);
+    }
+
+    // CMYK support, uncompressed and JPEG compressed
+
+    private static BufferedImage createCMYK(final int width, final int height) {
+        ColorSpace cmyk = ColorSpaces.getColorSpace(ColorSpaces.CS_GENERIC_CMYK);
+        ImageTypeSpecifier spec = ImageTypeSpecifiers.createInterleaved(cmyk, new int[] {0, 1, 2, 3}, DataBuffer.TYPE_BYTE, false, false);
+        BufferedImage image = spec.createBufferedImage(width, height);
+
+        // Smooth ramps (JPEG friendly), each channel varying differently, to catch any channel mix-up
+        WritableRaster raster = image.getRaster();
+        int[] pixel = new int[4];
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                pixel[0] = 16 + 200 * x / width;    // Cyan, ramps left to right
+                pixel[1] = 16 + 200 * y / height;   // Magenta, ramps top to bottom
+                pixel[2] = 216 - 200 * x / width;   // Yellow, ramps right to left
+                pixel[3] = 32;                      // Black, constant
+
+                raster.setPixel(x, y, pixel);
+            }
+        }
+
+        return image;
+    }
+
+    /**
+     * Returns the number of components in the SOF (Start Of Frame) marker of the JPEG stream
+     * starting at {@code offset} in {@code data}.
+     */
+    private static int jpegComponentCount(final byte[] data, final int offset) {
+        assertEquals(0xFFD8, (data[offset] & 0xff) << 8 | data[offset + 1] & 0xff, "Expected JPEG SOI marker");
+
+        for (int i = offset + 2; i < data.length - 1; ) {
+            if ((data[i] & 0xff) != 0xFF) {
+                break;
+            }
+
+            int marker = data[i + 1] & 0xff;
+
+            // Markers without a length field: TEM, RSTn, SOI, EOI and fill bytes
+            if (marker == 0x01 || marker >= 0xD0 && marker <= 0xD9 || marker == 0xFF) {
+                i += 2;
+                continue;
+            }
+
+            // SOF0 - SOF15, except DHT (C4), JPG (C8) and DAC (CC)
+            if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+                // length (2), sample precision (1), lines (2), samples/line (2), then the component count
+                return data[i + 9] & 0xff;
+            }
+
+            i += 2 + ((data[i + 2] & 0xff) << 8 | data[i + 3] & 0xff);
+        }
+
+        throw new AssertionError("No SOF marker found in JPEG stream at offset " + offset);
+    }
+
+    /** Reads the image back as raw (unconverted) samples, ie. CMYK stays CMYK. */
+    private BufferedImage readSingleRaw(final byte[] data) throws IOException {
+        try (ImageInputStream input = new ByteArrayImageInputStream(data)) {
+            ImageReader reader = ImageIO.getImageReaders(input).next();
+
+            try {
+                reader.setInput(input);
+
+                ImageReadParam readParam = reader.getDefaultReadParam();
+                readParam.setDestinationType(reader.getRawImageType(0));
+
+                return reader.read(0, readParam);
+            }
+            finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    @Test
+    public void testWriteUncompressedCMYK() throws IOException {
+        BufferedImage image = createCMYK(40, 20);
+
+        byte[] data = writeSingle(image, null);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertEquals(TIFFExtension.PHOTOMETRIC_SEPARATED, (int) longs(ifd.getEntryById(TIFF.TAG_PHOTOMETRIC_INTERPRETATION))[0]);
+        assertEquals(4, (int) longs(ifd.getEntryById(TIFF.TAG_SAMPLES_PER_PIXEL))[0]);
+
+        assertSamplesEquals("Uncompressed CMYK samples differ", image.getRaster(), readSingleRaw(data).getRaster());
+    }
+
+    @Test
+    public void testWriteJPEGCompressedCMYK() throws IOException {
+        BufferedImage image = createCMYK(80, 40);
+
+        TIFFImageWriter writer = createWriter();
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+        param.setCompressionType("JPEG");
+        param.setCompressionQuality(1f);
+        writer.dispose();
+
+        byte[] data = writeSingle(image, param);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertEquals(TIFFExtension.COMPRESSION_JPEG, (int) longs(ifd.getEntryById(TIFF.TAG_COMPRESSION))[0]);
+        assertEquals(TIFFExtension.PHOTOMETRIC_SEPARATED, (int) longs(ifd.getEntryById(TIFF.TAG_PHOTOMETRIC_INTERPRETATION))[0],
+                     "JPEG compressed CMYK should keep PhotometricInterpretation Separated");
+        assertEquals(4, (int) longs(ifd.getEntryById(TIFF.TAG_SAMPLES_PER_PIXEL))[0]);
+
+        // The strip must hold a 4 component JPEG stream (not a 3 component/YCbCr one), see TIFF Technote 2
+        int stripOffset = (int) longs(ifd.getEntryById(TIFF.TAG_STRIP_OFFSETS))[0];
+        assertEquals(4, jpegComponentCount(data, stripOffset), "Expected a 4 component (CMYK) JPEG stream");
+
+        // The CMYK samples survive the round-trip (JPEG is lossy, so allow some slack)
+        assertSamplesEquals("JPEG compressed CMYK samples differ", image.getRaster(), readSingleRaw(data).getRaster(), 8);
+    }
+
+    @Test
+    public void testWriteJPEGCompressedCMYKTiled() throws IOException {
+        BufferedImage image = createCMYK(100, 60);
+
+        TIFFImageWriter writer = createWriter();
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+        param.setCompressionType("JPEG");
+        param.setCompressionQuality(1f);
+        param.setTilingMode(ImageWriteParam.MODE_EXPLICIT);
+        param.setTiling(32, 16, 0, 0);
+        writer.dispose();
+
+        byte[] data = writeSingle(image, param);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertEquals(TIFFExtension.PHOTOMETRIC_SEPARATED, (int) longs(ifd.getEntryById(TIFF.TAG_PHOTOMETRIC_INTERPRETATION))[0]);
+
+        // One 4 component JPEG stream per tile
+        long[] tileOffsets = longs(ifd.getEntryById(TIFF.TAG_TILE_OFFSETS));
+        assertEquals(((100 + 31) / 32) * ((60 + 15) / 16), tileOffsets.length);
+
+        for (long tileOffset : tileOffsets) {
+            assertEquals(4, jpegComponentCount(data, (int) tileOffset), "Expected a 4 component (CMYK) JPEG stream per tile");
+        }
+
+        assertSamplesEquals("Tiled JPEG compressed CMYK samples differ", image.getRaster(), readSingleRaw(data).getRaster(), 8);
     }
 
     private static class ImageInfo {

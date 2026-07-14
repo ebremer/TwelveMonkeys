@@ -84,8 +84,6 @@ import static com.twelvemonkeys.imageio.plugins.tiff.TIFFStreamMetadata.configur
  */
 public final class TIFFImageWriter extends ImageWriterBase {
     // Long term
-    // TODO: Support JPEG compression of CMYK data (pending JPEGImageWriter CMYK write support)
-    // ----
     // TODO: Support use-case: Transcode multi-layer PSD to multi-page TIFF with metadata (hard, as Photoshop don't store layers as multi-page TIFF...)
     // TODO: Support use-case: Transcode multi-page TIFF to multiple single-page TIFFs with metadata
     // TODO: Support use-case: Losslessly transcode JPEG to JPEG-in-TIFF with (EXIF) metadata (and back)
@@ -113,6 +111,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
     // Support 16 bit multi-channel (ie. RGB/RGBA) sample writing
     // Support planar (PlanarConfiguration 2) writing, controlled by the image metadata
     // Support thumbnails, written as reduced-resolution images in SubIFDs (tag 330)
+    // Support JPEG compression of CMYK data (written as a raster, photometric Separated, as in TIFF Technote 2)
 
     /** The TIFF 6.0 spec recommends writing strips of about 8K bytes (before compression). */
     private static final long DEFAULT_STRIP_SIZE = 8L * 1024;
@@ -936,14 +935,13 @@ public final class TIFFImageWriter extends ImageWriterBase {
     private void writeJPEGSegments(final int imageIndex, final IIOImage image, final RenderedImage renderedImage, final ImageWriteParam param,
                                    final SegmentLayout layout, final long[] segmentOffsets, final long[] segmentByteCounts) throws IOException {
         // TODO: Cache JPEGImageWriter, dispose in dispose() method
-        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("JPEG");
 
-        if (!writers.hasNext()) {
-            // This can only happen if someone deliberately uninstalled it
-            throw new IIOException("No JPEG ImageWriter found!");
-        }
+        // CMYK data can't be JPEG encoded as an image, as the JPEG writers support gray and RGB color
+        // models only. Instead, the raw 4 channel data is encoded as a Raster. PhotometricInterpretation
+        // is already Separated, and readers interpret the 4 channel JPEG stream accordingly (TIFF Technote 2)
+        boolean cmyk = renderedImage.getColorModel().getColorSpace().getType() == ColorSpace.TYPE_CMYK;
 
-        ImageWriter jpegWriter = writers.next();
+        ImageWriter jpegWriter = createJPEGDelegate(cmyk);
 
         try {
             if (!layout.tiled && segmentOffsets.length == 1) {
@@ -954,7 +952,9 @@ public final class TIFFImageWriter extends ImageWriterBase {
                 ListenerDelegate listener = new ListenerDelegate(imageIndex);
                 jpegWriter.addIIOWriteProgressListener(listener);
                 jpegWriter.addIIOWriteWarningListener(listener);
-                jpegWriter.write(null, imageOnly(image), copyParams(param, jpegWriter));
+
+                IIOImage jpegImage = cmyk ? new IIOImage(rasterOf(renderedImage), null, null) : imageOnly(image);
+                jpegWriter.write(null, jpegImage, copyParams(param, jpegWriter));
 
                 segmentByteCounts[0] = imageOutput.getStreamPosition() - segmentOffsets[0];
             }
@@ -982,8 +982,10 @@ public final class TIFFImageWriter extends ImageWriterBase {
                         jpegWriter.setOutput(new SubImageOutputStream(imageOutput));
 
                         WritableRaster tileRaster = paddedTile(renderedImage, region, layout.segmentWidth, layout.segmentHeight);
-                        BufferedImage tile = new BufferedImage(colorModel, tileRaster, colorModel.isAlphaPremultiplied(), null);
-                        jpegWriter.write(null, new IIOImage(tile, null, null), copyParams(param, jpegWriter));
+                        IIOImage jpegImage = cmyk
+                                             ? new IIOImage(tileRaster, null, null)
+                                             : new IIOImage(new BufferedImage(colorModel, tileRaster, colorModel.isAlphaPremultiplied(), null), null, null);
+                        jpegWriter.write(null, jpegImage, copyParams(param, jpegWriter));
 
                         segmentByteCounts[segment] = imageOutput.getStreamPosition() - segmentOffsets[segment];
                         segment++;
@@ -998,6 +1000,35 @@ public final class TIFFImageWriter extends ImageWriterBase {
         finally {
             jpegWriter.dispose();
         }
+    }
+
+    /**
+     * Returns a JPEG {@code ImageWriter} delegate, that supports writing {@code Raster}s if required.
+     *
+     * @param needsRasterSupport {@code true} if the data will be passed as a {@code Raster}
+     *                           (ie. for CMYK, which the JPEG writers can't encode as an image).
+     */
+    private ImageWriter createJPEGDelegate(final boolean needsRasterSupport) throws IIOException {
+        Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("JPEG");
+
+        while (writers.hasNext()) {
+            ImageWriter writer = writers.next();
+
+            if (!needsRasterSupport || writer.canWriteRasters()) {
+                return writer;
+            }
+
+            writer.dispose();
+        }
+
+        // This can only happen if someone deliberately uninstalled it
+        throw new IIOException(needsRasterSupport
+                               ? "No JPEG ImageWriter with Raster support found (required for JPEG compressed CMYK)!"
+                               : "No JPEG ImageWriter found!");
+    }
+
+    private static Raster rasterOf(final RenderedImage image) {
+        return image instanceof BufferedImage ? ((BufferedImage) image).getRaster() : image.getData();
     }
 
     /**
