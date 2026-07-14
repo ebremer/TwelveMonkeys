@@ -111,6 +111,7 @@ public final class TIFFImageWriter extends ImageWriterBase {
     // Support storing multiple images in one stream (multi-page TIFF)
     // Support more of the ImageIO metadata (ie. compression from metadata, etc)
     // Support multiple strips (about 8K per strip, as recommended by the TIFF 6.0 spec) and tiled writing
+    // Support 16 bit multi-channel (ie. RGB/RGBA) sample writing
 
     /** The TIFF 6.0 spec recommends writing strips of about 8K bytes (before compression). */
     private static final long DEFAULT_STRIP_SIZE = 8L * 1024;
@@ -804,8 +805,8 @@ public final class TIFFImageWriter extends ImageWriterBase {
      * Validates that the sample layout of {@code sampleModel} can be written, and returns its
      * (uniform) BitsPerSample value.
      * <p>
-     * NOTE: Multi-channel data is currently supported for 8 bit samples only, and floating point
-     * samples are not yet supported.
+     * NOTE: Multi-channel data is currently supported for 8 and 16 bit samples only, and floating
+     * point samples are not yet supported.
      * </p>
      */
     private static int validateBitsPerSample(final SampleModel sampleModel) throws IIOException {
@@ -826,14 +827,15 @@ public final class TIFFImageWriter extends ImageWriterBase {
 
         switch (bitsPerSample) {
             case 8:
+            case 16:
                 break;
 
             case 1:
             case 2:
             case 4:
-            case 16:
             case 32:
-                // TODO: Support multiple channels for 16 and 32 bit samples
+                // Sub-byte samples are bit packed, and thus single band only.
+                // TODO: Support multiple channels for 32 bit samples, along with floating point support
                 if (sampleSize.length != 1) {
                     throw new IIOException(String.format("Unsupported BitsPerSample (%d) for %d samples per pixel (expected 1 sample per pixel)",
                                                          bitsPerSample, sampleSize.length));

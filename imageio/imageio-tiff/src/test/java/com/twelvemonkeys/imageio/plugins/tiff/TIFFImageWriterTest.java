@@ -1438,12 +1438,16 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
     }
 
     private byte[] writeSingle(final RenderedImage image, final ImageWriteParam param) throws IOException {
+        return writeSingle(image, param, null);
+    }
+
+    private byte[] writeSingle(final RenderedImage image, final ImageWriteParam param, final IIOMetadata streamMetadata) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
 
         try (ImageOutputStream output = ImageIO.createImageOutputStream(bytes)) {
             TIFFImageWriter writer = createWriter();
             writer.setOutput(output);
-            writer.write(null, new IIOImage(image, null, null), param);
+            writer.write(streamMetadata, new IIOImage(image, null, null), param);
             writer.dispose();
         }
 
@@ -1632,6 +1636,104 @@ public class TIFFImageWriterTest extends ImageWriterAbstractTest<TIFFImageWriter
         assertEquals(48, (int) longs(ifd.getEntryById(TIFF.TAG_TILE_HEIGTH))[0], "Tile length should be rounded up to multiple of 16");
 
         assertImageEquals("Tiled image differs", image, readSingle(data), 0);
+    }
+
+    // 16 bit multi-channel support
+
+    private static void assertSamplesEquals(final String message, final Raster expected, final Raster actual) {
+        assertEquals(expected.getWidth(), actual.getWidth(), message + ", widths differ");
+        assertEquals(expected.getHeight(), actual.getHeight(), message + ", heights differ");
+        assertEquals(expected.getNumBands(), actual.getNumBands(), message + ", band count differs");
+
+        for (int y = 0; y < expected.getHeight(); y++) {
+            for (int x = 0; x < expected.getWidth(); x++) {
+                for (int b = 0; b < expected.getNumBands(); b++) {
+                    assertEquals(expected.getSample(expected.getMinX() + x, expected.getMinY() + y, b),
+                                 actual.getSample(actual.getMinX() + x, actual.getMinY() + y, b),
+                                 String.format("%s, sample at (%d,%d) band %d differs", message, x, y, b));
+                }
+            }
+        }
+    }
+
+    private static BufferedImage create16BitRGB(final int width, final int height, final boolean alpha) {
+        ImageTypeSpecifier spec = alpha
+                                  ? ImageTypeSpecifiers.createInterleaved(ColorSpace.getInstance(ColorSpace.CS_sRGB), new int[] {0, 1, 2, 3}, DataBuffer.TYPE_USHORT, true, false)
+                                  : ImageTypeSpecifiers.createInterleaved(ColorSpace.getInstance(ColorSpace.CS_sRGB), new int[] {0, 1, 2}, DataBuffer.TYPE_USHORT, false, false);
+        BufferedImage image = spec.createBufferedImage(width, height);
+        fillGradient(image);
+
+        return image;
+    }
+
+    @Test
+    public void testWrite16BitRGB() throws IOException {
+        for (String compression : Arrays.asList("None", "LZW", "ZLib", "Deflate", "PackBits")) {
+            BufferedImage image = create16BitRGB(31, 17, false);
+
+            TIFFImageWriter writer = createWriter();
+            ImageWriteParam param = writer.getDefaultWriteParam();
+            param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+            param.setCompressionType(compression);
+            writer.dispose();
+
+            byte[] data = writeSingle(image, param);
+
+            Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+            assertArrayEquals(new long[] {16, 16, 16}, longs(ifd.getEntryById(TIFF.TAG_BITS_PER_SAMPLE)));
+            assertEquals(3, (int) longs(ifd.getEntryById(TIFF.TAG_SAMPLES_PER_PIXEL))[0]);
+            assertEquals(TIFFBaseline.PHOTOMETRIC_RGB, (int) longs(ifd.getEntryById(TIFF.TAG_PHOTOMETRIC_INTERPRETATION))[0]);
+
+            BufferedImage read = readSingle(data);
+            assertSamplesEquals("16 bit RGB " + compression + " samples differ", image.getRaster(), read.getRaster());
+        }
+    }
+
+    @Test
+    public void testWrite16BitRGBA() throws IOException {
+        BufferedImage image = create16BitRGB(23, 19, true);
+
+        byte[] data = writeSingle(image, null);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertArrayEquals(new long[] {16, 16, 16, 16}, longs(ifd.getEntryById(TIFF.TAG_BITS_PER_SAMPLE)));
+        assertEquals(4, (int) longs(ifd.getEntryById(TIFF.TAG_SAMPLES_PER_PIXEL))[0]);
+        assertEquals(TIFFBaseline.EXTRASAMPLE_UNASSOCIATED_ALPHA, (int) longs(ifd.getEntryById(TIFF.TAG_EXTRA_SAMPLES))[0]);
+
+        BufferedImage read = readSingle(data);
+        assertSamplesEquals("16 bit RGBA samples differ", image.getRaster(), read.getRaster());
+    }
+
+    @Test
+    public void testWrite16BitRGBTiled() throws IOException {
+        BufferedImage image = create16BitRGB(100, 60, false);
+
+        TIFFImageWriter writer = createWriter();
+        ImageWriteParam param = writer.getDefaultWriteParam();
+        param.setTilingMode(ImageWriteParam.MODE_EXPLICIT);
+        param.setTiling(32, 16, 0, 0);
+        writer.dispose();
+
+        byte[] data = writeSingle(image, param);
+
+        Directory ifd = new TIFFReader().read(new ByteArrayImageInputStream(data));
+        assertArrayEquals(new long[] {16, 16, 16}, longs(ifd.getEntryById(TIFF.TAG_BITS_PER_SAMPLE)));
+        assertEquals(((100 + 31) / 32) * ((60 + 15) / 16), longs(ifd.getEntryById(TIFF.TAG_TILE_OFFSETS)).length);
+
+        BufferedImage read = readSingle(data);
+        assertSamplesEquals("16 bit RGB tiled samples differ", image.getRaster(), read.getRaster());
+    }
+
+    @Test
+    public void testWrite16BitRGBLittleEndian() throws IOException {
+        BufferedImage image = create16BitRGB(31, 17, false);
+
+        byte[] data = writeSingle(image, null, new TIFFStreamMetadata(ByteOrder.LITTLE_ENDIAN));
+
+        assertArrayEquals(new byte[] {'I', 'I', 42, 0}, Arrays.copyOf(data, 4));
+
+        BufferedImage read = readSingle(data);
+        assertSamplesEquals("16 bit RGB little endian samples differ", image.getRaster(), read.getRaster());
     }
 
     private static class ImageInfo {
